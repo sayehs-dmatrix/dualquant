@@ -1,0 +1,37 @@
+{
+    "dualquant": {
+        "scale_option": "row_column",
+        "row_init": "max_abs",
+        "col_init": "l1_norm",
+        "num_iter": 15,
+        "num_splits": 1,
+        "dualquant_to_element_tensor": false
+    },
+
+    "gptq": {
+        "blocksize": 128,
+        "percdamp": 0.01
+    },
+
+    "gptq_seq": {
+        "blocksize": 128,
+        "percdamp": 0.01
+    },
+
+    "awq": {},
+
+    "sinq": {},
+
+    "rtn": {},
+
+    "smoothquant": {
+        "alpha": 0.5
+    },
+
+    "quarot": {
+        "rotate_mode": "hadamard",
+        "seed": 0
+    }
+}
+
+
