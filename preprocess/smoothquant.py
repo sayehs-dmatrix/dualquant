@@ -27,18 +27,20 @@ def apply_smoothquant(model, preprocess_cfg):
         raise ValueError("smoothquant preprocess requires preprocess_cfg['act_scales_path']")
     act_scales = torch.load(preprocess_cfg["act_scales_path"])
     alpha = preprocess_cfg.get("alpha", 0.5)
-    saved_scales = smooth_lm(model, act_scales, alpha)
+    weight_stat = preprocess_cfg.get("weight_stat", "max_abs")
+    saved_scales = smooth_lm(model, act_scales, alpha, weight_stat=weight_stat)
     ############## Save debugging information ################
     model_name = model.config._name_or_path
     safe_model_name = model_name.replace("/", "_")
     scales_dict = {
         "model_name": model_name,
         "alpha": alpha,
+        "weight_stat": weight_stat,
         "saved_scales": saved_scales,
         "act_scales": act_scales
     }
     os.makedirs(_SCALES_DIR, exist_ok=True)
-    filename = os.path.join(_SCALES_DIR, f"SQ_scales_{safe_model_name}_alpha_{alpha}.pt")
+    filename = os.path.join(_SCALES_DIR, f"SQ_scales_{safe_model_name}_alpha_{alpha}_wstat_{weight_stat}.pt")
     torch.save(scales_dict, filename)
     print(f"Saved to: {filename}")
     ##########################################################

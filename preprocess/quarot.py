@@ -1,9 +1,11 @@
 """QuaRot preprocess — calibration-free rotation of the residual stream.
 
-R1 is always applied (mathematically lossless). R2 + R4 are applied only
-when the activation-quant pipeline is on, because their offline halves need
-the online halves (installed in PermLinear by main.py) to cancel and stay
-lossless.
+R1 is always applied (mathematically lossless). R2 + R4 are now also always
+applied by default. Their offline halves are folded into the weights here;
+main.py installs the matching online halves in PermLinear so the H @ H = I
+cancellation holds at forward time — with act_quant_enabled=False for weight-
+only quant (activations pass through unquantised) or act_quant_enabled=True
+for full W+A quant.
 
 preprocess_cfg keys (all optional):
     rotate_mode  (str, default "random")  — "random" (QR of Gaussian) or
@@ -14,9 +16,9 @@ preprocess_cfg keys (all optional):
                                             sizes in get_hadK)
     seed         (int, default None)      — global torch seed used right
                                             before generating Q
-    r2_r4        (bool, default auto)     — explicit override. If unset,
-                                            defaults to `act_quant_enabled`
-                                            (injected by main.py).
+    r2_r4        (bool, default True)     — set False to apply R1 only
+                                            (disables the online Hadamard
+                                            install in main.py too).
     verbose      (bool, default False)    — print progress
 
 Architecture: this preprocess rotates the model in-place; subsequent
@@ -44,10 +46,11 @@ def apply_quarot(model, preprocess_cfg):
     seed = preprocess_cfg.get("seed", None)
     verbose = bool(preprocess_cfg.get("verbose", False))
 
-    # R2/R4 default = act_quant_enabled (auto-detect from main.py). User can
-    # override via preprocess_cfg["r2_r4"].
-    act_quant_enabled = bool(preprocess_cfg.get("_act_quant_enabled", False))
-    apply_r2_r4 = bool(preprocess_cfg.get("r2_r4", act_quant_enabled))
+    # R2/R4 default = True (always apply). The online halves are installed by
+    # main.py via install_online_hadamards — for act_quant=off via pass-through
+    # PermLinears (act_quant_enabled=False), for act_quant=on via the normal
+    # PermLinear path. User can override via preprocess_cfg["r2_r4"] = false.
+    apply_r2_r4 = bool(preprocess_cfg.get("r2_r4", True))
 
     if seed is not None:
         torch.manual_seed(int(seed))

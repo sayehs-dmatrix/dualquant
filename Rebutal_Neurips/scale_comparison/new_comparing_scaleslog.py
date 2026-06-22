@@ -156,9 +156,9 @@ def compare_scales(s1, s2, name="", eps=1e-8, topk_vals=(10, 20, 50)):
 
 # ── Pick a model ────────────────────────────────────────────────────────────
 # MODEL = "meta-llama_Llama-3.1-8B"
-MODEL = "meta-llama_Llama-3.2-1B"
+# MODEL = "meta-llama_Llama-3.2-1B"
 # MODEL = "Qwen_Qwen3-0.6B"
-# MODEL = "Qwen_Qwen2.5-7B"
+MODEL = "Qwen_Qwen2.5-7B"
 
 SQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_smoothquant_rtn_int4"
 DQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_dualquant_rtn_int4"
@@ -301,3 +301,67 @@ for proj in proj_map:
     print(f"{proj:<10} | "
           f"{row[0]:>+8.4f} {row[1]:>+8.4f} {row[2]:>+8.4f}   | "
           f"{row[3]:>+8.4f} {row[4]:>+8.4f} {row[5]:>+8.4f}")
+
+
+# ── PDF output: color-coded heatmaps, one page per metric ────────────────────
+import os
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
+_COMPARISONS = [
+    ("[B] SQ.5pp vs DQ",       "B_sq05pp_vs_dq"),
+    ("[D] SQ.0pp vs DQ",       "D_sq00pp_vs_dq"),
+    ("[E] SQ.5pp vs SQ.0pp",   "E_sq05pp_vs_sq00pp"),
+    ("[C] SQ.5share vs DQ",    "C_sq05share_vs_dq"),
+    ("[C0] SQ.0share vs DQ",   "C0_sq00share_vs_dq"),
+]
+_METRICS = [
+    ("Pearson",     "pearson_raw"),
+    ("Log-Pearson", "pearson_log"),
+    ("Spearman",    "spearman_raw"),
+]
+
+
+def _build_matrix(metric_key):
+    """Return (5 projections × 5 comparisons) np.ndarray of mean correlations."""
+    M = np.zeros((len(proj_map), len(_COMPARISONS)))
+    for i, proj in enumerate(proj_map):
+        for j, (_, tbl_key) in enumerate(_COMPARISONS):
+            M[i, j] = safe_mean(results[tbl_key], proj, metric_key)
+    return M
+
+
+_OUT_PDF = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    f"summary_tables_{MODEL}.pdf",
+)
+
+with PdfPages(_OUT_PDF) as pdf:
+    for metric_label, metric_key in _METRICS:
+        mat = _build_matrix(metric_key)
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        # RdBu_r diverges around 0; correlation lives in [-1, 1].
+        im = ax.imshow(mat, cmap="RdBu_r", vmin=-1.0, vmax=1.0, aspect="auto")
+        # Annotate each cell with its value.
+        for i in range(mat.shape[0]):
+            for j in range(mat.shape[1]):
+                v = mat[i, j]
+                # White text on dark cells, black on light — based on |value|.
+                color = "white" if abs(v) > 0.55 else "black"
+                ax.text(j, i, f"{v:+.3f}", ha="center", va="center",
+                        color=color, fontsize=10)
+        ax.set_xticks(range(len(_COMPARISONS)))
+        ax.set_xticklabels([c[0] for c in _COMPARISONS],
+                           rotation=20, ha="right", fontsize=9)
+        ax.set_yticks(range(len(proj_map)))
+        ax.set_yticklabels(list(proj_map), fontsize=10)
+        ax.set_title(f"{MODEL}  —  {metric_label}  (mean over {NUM_LAYERS} layers)",
+                     fontsize=11, pad=12)
+        cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+        cbar.set_label("correlation", fontsize=9)
+        cbar.ax.tick_params(labelsize=8)
+        plt.tight_layout()
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+print(f"\nWrote heatmap PDF: {_OUT_PDF}")

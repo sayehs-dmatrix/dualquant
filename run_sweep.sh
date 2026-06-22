@@ -10,6 +10,7 @@ set -euo pipefail
 # ── GPU / env ──────────────────────────────────────────────────────────────────
 export CUDA_VISIBLE_DEVICES=0,1
 export HF_DATASETS_TRUST_REMOTE_CODE=1
+export CUDA_HOME=/home/coder/miniconda3   # use CUDA 12.8 nvcc (supports c++20) instead of /usr/local/cuda (11.8)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
@@ -32,9 +33,9 @@ MODELS=(
 
 # ── Methods (one row of the new --method flag) ─────────────────────────────────
 METHODS=(
-    rtn
+    # rtn
     # dualquant
-    # gptq_seq       # sequential, slower, required for rtn_int4/int8
+    gptq_seq       # sequential, slower, required for rtn_int4/int8
     # gptq          # parallel, fast, works for block formats (mxfp4, mxint4, etc.)     
     # awq
     # sinq
@@ -47,9 +48,10 @@ WEIGHT_FMTS=(
     # mxfp8_e4m3
     # mxfp8_e5m2
     # mxint8
-    nvfp4
+    # nvfp4
     # sfp4
-    # rtn_int4
+    rtn_int4
+    # rtn_int4_asym
     # rtn_int8
 )
 
@@ -60,16 +62,22 @@ fmt_defaults() {
         nvfp4)                                     echo "16 e4m3" ;;
         sfp4)                                      echo "16 e4m4" ;;
         rtn_int4)                                  echo "64 none" ;;
+        rtn_int4_asym)                             echo "64 none" ;;
         rtn_int8)                                  echo "64 none" ;;   # per-channel (block_size unused)
         *) echo "unknown format $1" >&2; exit 1 ;;
     esac
 }
 
 # ── Activation quantisation (off by default; flip ACT_QUANT=on to enable) ──────
-ACT_QUANT="${ACT_QUANT:-on}"
-ACT_FMT="${ACT_FMT:-nvfp4}"
-ACT_BLOCK_SIZE="${ACT_BLOCK_SIZE:-16}"
-ACT_SCALE_FORMAT="${ACT_SCALE_FORMAT:-e4m3}"
+ACT_QUANT="${ACT_QUANT:-off}"
+ACT_FMT="${ACT_FMT:-rtn_int4}"
+ACT_BLOCK_SIZE="${ACT_BLOCK_SIZE:-64}"
+ACT_SCALE_FORMAT="${ACT_SCALE_FORMAT:-none}"
+
+# ACT_QUANT="${ACT_QUANT:-on}"
+# ACT_FMT="${ACT_FMT:-mxint4}"
+# ACT_BLOCK_SIZE="${ACT_BLOCK_SIZE:-32}"
+# ACT_SCALE_FORMAT="${ACT_SCALE_FORMAT:-e8m0}"
 
 # ACT_QUANT="${ACT_QUANT:-on}"
 # ACT_FMT="${ACT_FMT:-mxint4}"
@@ -78,9 +86,8 @@ ACT_SCALE_FORMAT="${ACT_SCALE_FORMAT:-e4m3}"
 
 # ── Preprocess (none | smoothquant | quarot) ──────────────────────────────────
 #   Override via env: PREPROCESS=quarot bash run_sweep.sh
-#   QuaRot R2/R4 auto-fire when ACT_QUANT=on (main.py auto-detects); with
-#   ACT_QUANT=off, QuaRot uses R1 only.
-PREPROCESS="${PREPROCESS:-quarot}"
+#   QuaRot always applies R1+R2+R4 regardless of ACT_QUANT (fixed 2026-05-27).
+PREPROCESS="${PREPROCESS:-none}"
 
 # ── SmoothQuant per-model scales (only consulted when PREPROCESS=smoothquant) ──
 # Maps each model in MODELS=(...) to its specific .pt file under
@@ -144,6 +151,11 @@ for model in "${MODELS[@]}"; do
                 --results-path          "${RESULTS_CSV}"
                 --preprocess            "${PREPROCESS}"
             )
+            # MSE-optimal weight clipping for rtn_int4/rtn_int8 + QuaRot
+            # (required with QuaRot rotations; ignored silently for other formats)
+            if [[ "${fmt}" == rtn_int* && "${PREPROCESS}" == "quarot" ]]; then
+                ARGS+=(--weight-clip)
+            fi
             if [[ "${ACT_QUANT}" == "on" ]]; then
                 ARGS+=(
                     --act-quant            on

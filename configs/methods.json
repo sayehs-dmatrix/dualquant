@@ -25,7 +25,8 @@
     "rtn": {},
 
     "smoothquant": {
-        "alpha": 0.5
+        "alpha": 0.5,
+        "weight_stat": "max_abs"
     },
 
     "quarot": {

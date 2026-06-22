@@ -9,7 +9,7 @@ from .mx import (
     make_mxint8,
 )
 from .nvfp4 import make_nvfp4
-from .rtn_int import make_rtn_int4, make_rtn_int8
+from .rtn_int import make_rtn_int4, make_rtn_int4_asym, make_rtn_int8
 from .sfp4 import make_sfp4
 
 _FACTORIES = {
@@ -21,6 +21,7 @@ _FACTORIES = {
     "nvfp4": make_nvfp4,
     "sfp4": make_sfp4,
     "rtn_int4": make_rtn_int4,
+    "rtn_int4_asym": make_rtn_int4_asym,
     "rtn_int8": make_rtn_int8,
 }
 
@@ -34,6 +35,12 @@ def make_format(name: str, **fmt_cfg) -> FormatSpec:
         if fmt_cfg.get("block_size") not in (None, 16):
             raise ValueError(f"{name} block_size is fixed at 16 (got {fmt_cfg.get('block_size')})")
         return factory()
+    # `mse` (MSE-optimal weight clipping) is only supported for rtn_int4/rtn_int8;
+    # strip it silently for other formats so the caller can pass it unconditionally.
+    if name not in ("rtn_int4", "rtn_int4_asym", "rtn_int8"):
+        fmt_cfg.pop("mse", None)
+    if name == "rtn_int4_asym":
+        fmt_cfg.pop("mse", None)  # asym variant doesn't support MSE clipping
     return factory(**fmt_cfg)
 
 

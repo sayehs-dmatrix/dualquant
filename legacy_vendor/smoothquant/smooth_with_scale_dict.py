@@ -14,7 +14,11 @@ from transformers.models.mixtral.modeling_mixtral import (
 )
 from transformers.models.falcon.modeling_falcon import FalconDecoderLayer
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RMSNorm
-from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMSNorm
+try:
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMSNorm
+except ImportError:
+    Qwen3DecoderLayer = None
+    Qwen3RMSNorm = None
 
 
 @torch.no_grad()
@@ -65,6 +69,7 @@ def smooth_ln_fcs_llama_like(
     alpha=0.5,
     save_dict=None,
     save_key=None,
+    weight_stat="max_abs",
 ):
     if not isinstance(fcs, list):
         fcs = [fcs]
@@ -78,11 +83,19 @@ def smooth_ln_fcs_llama_like(
 
     act_scales = act_scales.to(device=device, dtype=dtype)
 
-    weight_scales = torch.cat(
-        [fc.weight.abs().max(dim=0, keepdim=True)[0] for fc in fcs], dim=0
-    )
+    def _col_stat(w):
+        if weight_stat == "max_abs":
+            return w.abs().max(dim=0)[0].clamp(min=1e-5)
+        elif weight_stat == "l1_norm":
+            return w.abs().sum(dim=0).clamp(min=1e-5)
+        else:
+            raise ValueError(f"smooth_ln_fcs_llama_like: unknown weight_stat {weight_stat!r}")
 
-    weight_scales = weight_scales.max(dim=0)[0].clamp(min=1e-5)
+    # shared scale: column stat per fc, then take max across projections
+    weight_scales = torch.cat(
+        [_col_stat(fc.weight).unsqueeze(0) for fc in fcs], dim=0
+    ).max(dim=0)[0]
+
     scales = (
         (act_scales.pow(alpha) / weight_scales.pow(1 - alpha))
         .clamp(min=1e-5)
@@ -95,36 +108,27 @@ def smooth_ln_fcs_llama_like(
     if save_dict is not None and save_key is not None:
         save_dict[save_key] = (1.0 / scales).detach().cpu()
 
-        # ── per-projection variant: also stored as 1/scale for the same reason ──
+        # ── per-projection variant: computed from each fc's own column stat ──
         for fc in fcs:
-            # get key from tag set in smooth_lm
             if hasattr(fc, '_sq_save_name'):
                 proj_key = fc._sq_save_name
             else:
-                # fallback if tag missing: use position index
                 proj_key = f"{save_key}.fc{fcs.index(fc)}"
 
-            # compute this projection's own weight scale
-            w_scale = fc.weight.abs().max(dim=0)[0].clamp(min=1e-5)
-
-            # compute scale using only this projection's weights
+            w_scale = _col_stat(fc.weight)
             per_proj_s = (
                 (act_scales.pow(alpha) / w_scale.pow(1 - alpha))
                 .clamp(min=1e-5)
             )
-
             save_dict[proj_key] = (1.0 / per_proj_s).detach().cpu()
 
-
-    #################################################################################
     ln.weight.div_(scales)
     for fc in fcs:
         fc.weight.mul_(scales.view(1, -1))
 
 
 @torch.no_grad()
-def smooth_lm(model, scales, alpha=0.5):
-    # breakpoint()
+def smooth_lm(model, scales, alpha=0.5, weight_stat="max_abs"):
     saved_scales = {}
     for name, module in model.named_modules():
         # if isinstance(module, OPTDecoderLayer):
@@ -203,7 +207,8 @@ def smooth_lm(model, scales, alpha=0.5):
                 qkv_input_scales,
                 alpha,
                 save_dict=saved_scales,
-                save_key=name + ".attn"
+                save_key=name + ".attn",
+                weight_stat=weight_stat,
             )
 
             ffn_ln = module.post_attention_layernorm  # feed forward norm
@@ -217,14 +222,14 @@ def smooth_lm(model, scales, alpha=0.5):
 
             fcs_input_scales = scales[name + ".mlp.gate_proj"]
 
-            # smooth_ln_fcs_llama_like(ffn_ln, fcs, fcs_input_scales, alpha)
             smooth_ln_fcs_llama_like(
                 ffn_ln,
                 fcs,
                 fcs_input_scales,
                 alpha,
                 save_dict=saved_scales,
-                save_key=name + ".ffn"
+                save_key=name + ".ffn",
+                weight_stat=weight_stat,
             )
 
         elif isinstance(module, MixtralDecoderLayer):
@@ -236,14 +241,14 @@ def smooth_lm(model, scales, alpha=0.5):
             ]
 
             qkv_input_scales = scales[name + ".self_attn.q_proj"]
-            # smooth_ln_fcs_llama_like(attn_ln, qkv, qkv_input_scales, alpha)
             smooth_ln_fcs_llama_like(
                 attn_ln,
                 qkv,
                 qkv_input_scales,
                 alpha,
                 save_dict=saved_scales,
-                save_key=name + ".attn"
+                save_key=name + ".attn",
+                weight_stat=weight_stat,
             )
 
             ffn_ln = module.post_attention_layernorm  # feed forward norm
@@ -253,14 +258,14 @@ def smooth_lm(model, scales, alpha=0.5):
                 fcs.append(expert.w3)
             fcs_input_scales = scales[name + ".block_sparse_moe.gate"]
 
-            # smooth_ln_fcs_llama_like(ffn_ln, fcs, fcs_input_scales, alpha)
             smooth_ln_fcs_llama_like(
                 ffn_ln,
                 fcs,
                 fcs_input_scales,
                 alpha,
                 save_dict=saved_scales,
-                save_key=name + ".ffn"
+                save_key=name + ".ffn",
+                weight_stat=weight_stat,
             )
 
         elif isinstance(module, (Qwen2DecoderLayer, Qwen3DecoderLayer)):
@@ -280,14 +285,14 @@ def smooth_lm(model, scales, alpha=0.5):
             #########################################################################################################
 
             qkv_input_scales = scales[name + ".self_attn.q_proj"]
-            # smooth_ln_fcs_llama_like(attn_ln, qkv, qkv_input_scales, alpha)
             smooth_ln_fcs_llama_like(
                 attn_ln,
                 qkv,
                 qkv_input_scales,
                 alpha,
                 save_dict=saved_scales,
-                save_key=name + ".attn"
+                save_key=name + ".attn",
+                weight_stat=weight_stat,
             )
 
             ffn_ln = module.post_attention_layernorm
@@ -300,14 +305,14 @@ def smooth_lm(model, scales, alpha=0.5):
             #######################################################################################################
 
             fcs_input_scales = scales[name + ".mlp.gate_proj"]
-            # smooth_ln_fcs_llama_like(ffn_ln, fcs, fcs_input_scales, alpha)
             smooth_ln_fcs_llama_like(
                 ffn_ln,
                 fcs,
                 fcs_input_scales,
                 alpha,
                 save_dict=saved_scales,
-                save_key=name + ".ffn"
+                save_key=name + ".ffn",
+                weight_stat=weight_stat,
             )
     return saved_scales
 

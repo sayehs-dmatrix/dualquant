@@ -278,12 +278,18 @@ def _gptq_fwrd_adapter(model, dataloader, dev, *, weight_fmt, blocksize,
                     blocksize=blocksize, percdamp=percdamp, groupsize=fq_groupsize,
                     actorder=True,
                 )
+                w = subset[name].weight
+                if torch.isnan(w).any() or torch.isinf(w).any():
+                    print(f"  *** NaN/Inf in layer {i} {name} after GPTQ ***")
                 gptq[name].free()
 
         # Re-forward through the fully-quantised layer to populate outs;
         # next iteration's inps = this layer's quantised output.
         for j in range(nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), **fwd_kwargs)[0]
+
+        out0 = outs[0]
+        print(f"  layer {i} re-fwd: mean={out0.float().mean():.4f}  std={out0.float().std():.4f}  nan={torch.isnan(out0).any().item()}  inf={torch.isinf(out0).any().item()}")
 
         del gptq
         torch.cuda.empty_cache()

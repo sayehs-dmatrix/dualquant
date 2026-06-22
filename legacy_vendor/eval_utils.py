@@ -19,11 +19,12 @@ def evaluator_newVersion(model, tokenizer, dataset_enc, dev, arg, dataset):
     elif hasattr(model.config, "n_positions"):
         max_seq_len = model.config.n_positions
     else:
-        max_seq_len = 4096
-    # breakpoint()
+        max_seq_len = 2048
+    
     ###### Cap at 8192 but never exceed the model's trained RoPE range
     ###### (Llama-2: 4096; Llama-3: 131072; Qwen2/3: 32768+).
     max_seq_len = min(8192, model.config.max_position_embeddings)
+    print('max_seq_len:', max_seq_len)
     stride = max_seq_len
     # breakpoint()
     model.eval()

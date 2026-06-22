@@ -84,6 +84,9 @@ def parse_args():
     p.add_argument("--weight-block-size", type=int, default=32)
     p.add_argument("--weight-scale-format", default="e8m0",
                    choices=["e8m0", "e4m3", "e4m4", "e5m3", "none"])
+    p.add_argument("--weight-clip", action="store_true",
+                   help="MSE-optimal weight clipping for RTN (80-step grid search, "
+                        "equivalent to QuaRot --w_clip). Only affects rtn_int4/rtn_int8.")
 
     # ---- activation quantisation (orthogonal to weight format) ----
     p.add_argument("--act-quant", choices=["on", "off"], default="off")
@@ -125,7 +128,8 @@ def build_cfg(args, all_hyperparams):
     """Assemble the cfg dict that methods.wrap consumes."""
     method_cfg = all_hyperparams.get(args.method, {})
 
-    weight_fmt = make_format(args.weight_fmt, block_size=args.weight_block_size)
+    weight_fmt = make_format(args.weight_fmt, block_size=args.weight_block_size,
+                             mse=args.weight_clip)
 
     act_quant = {"enabled": False}
     if args.act_quant == "on":
@@ -179,6 +183,13 @@ def quantise_model(model, tokenizer, args, cfg):
         print(f"collecting calibration activations for {method.name}...")
         activations = collect_calib_activations(model, tokenizer)
         print(f"collected activations for {len(activations)} layers")
+        print(f"  sample keys: {list(activations.keys())[:4]}")
+        # sanity-check: verify the key pattern matches what calib_acts_for expects
+        expected = "model.layers.0.self_attn.q_proj"
+        print(f"  key '{expected}' present: {expected in activations}")
+        if expected in activations:
+            a = activations[expected]
+            print(f"  activation shape={a.shape}  mean={a.float().mean():.4f}  std={a.float().std():.4f}  allzero={a.eq(0).all().item()}")
 
     act_cfg = cfg["act_quant"]
     act_enabled = act_cfg.get("enabled", False)
@@ -220,16 +231,39 @@ def quantise_model(model, tokenizer, args, cfg):
                   f"act_fmt={(act_cfg['fmt'].name if act_enabled else 'off')}")
         if hasattr(method, "save_scales"):
             num_iter = cfg["method_cfg"].get("num_iter", 15)
-            saved = method.save_scales(args.model, num_iter, os.path.join(SCRIPT_DIR_OR_RESULTS, "scales_dualquant_rtn_int4"))
+            scale_option = cfg["method_cfg"]["scale_option"]
+            row_init = cfg["method_cfg"]["row_init"]
+            col_init = cfg["method_cfg"]["col_init"]
+            saved = method.save_scales(args.model, num_iter, os.path.join(SCRIPT_DIR_OR_RESULTS, "scales_dualquant_rtn_int4"), scale_option=scale_option, row_init=row_init, col_init=col_init)
             if saved: print(f"scales saved to {saved}")
 
         # QuaRot R2/R4 — install the online Hadamards on o_proj / down_proj PermLinear
         # wrappers, the second half of the offline+online identity. The reference
         # paper relies on the H @ H = I cancellation; without this call, the offline
-        # R2/R4 folds drift the network's output. Only meaningful when both QuaRot
-        # was the preprocess AND activation quant is on (i.e. PermLinears exist).
-        if args.preprocess == "quarot" and act_enabled:
+        # R2/R4 folds drift the network's output.
+        #
+        # act_quant=on:  PermLinears already installed above (with real act_fmt,
+        #                act_quant_enabled=True). Just set the online-had flags.
+        # act_quant=off: No PermLinears exist yet. Install pass-through ones
+        #                (act_quant_enabled=False) so the online Hadamard can
+        #                fire and cancel the offline R2/R4 weight folds while
+        #                leaving activations unquantised.
+        if args.preprocess == "quarot":
             from quarot import install_online_hadamards
+            if not act_enabled:
+                from activations import PermLinear  # install_perm_linear already at module level
+                dummy_fmt = cfg["weight_fmt"]  # act_quant_enabled=False → never called
+                for block in model.model.layers:
+                    for parent, names in ((block.self_attn, _ATTN_NAMES),
+                                          (block.mlp, _MLP_NAMES)):
+                        for n in names:
+                            if getattr(parent, n, None) is not None:
+                                install_perm_linear(parent, n, act_fmt=dummy_fmt,
+                                                    col_scales=None,
+                                                    quantize_bmm_input=False)
+                for m in model.modules():
+                    if isinstance(m, PermLinear):
+                        m.set_act_quant_enabled(False)
             install_online_hadamards(model, verbose=True)
 
 
@@ -259,13 +293,15 @@ def write_results_csv(args, ppl):
     with open(csv_path, "a", newline="") as fh:
         writer = csv.DictWriter(
             fh,
-            fieldnames=["model", "method", "weight_fmt", "act_fmt", "ppl_wikitext", "ppl_c4"],
+            fieldnames=["model", "method", "preprocess", "weight_fmt", "act_fmt",
+                        "ppl_wikitext", "ppl_c4"],
         )
         if write_header:
             writer.writeheader()
         writer.writerow({
             "model": args.model,
             "method": args.method,
+            "preprocess": args.preprocess,
             "weight_fmt": args.weight_fmt,
             "act_fmt": args.act_fmt if args.act_quant == "on" else "off",
             "ppl_wikitext": round(ppl["wikitext"], 4) if "wikitext" in ppl else "N/A",

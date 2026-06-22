@@ -1,3 +1,10 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Re-include files that the parent ../.gitignore filters out by extension
+# but that this codebase legitimately needs to track:
+!configs/methods.json
+!smoothquant/act_scales/*.pt
+!scales_dualquant_rtn_int4/*.pt
+!scales_smoothquant_rtn_int4/*.pt

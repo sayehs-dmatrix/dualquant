@@ -46,6 +46,8 @@ def _gptq_quantizer_for(format_name, block_size):
         return mxfp8_e5m2_quantizer_cls(block_size=block_size)
     if format_name == "rtn_int4":
         return nBits_quantizer(bits=4, group_size=-1, sym=True)
+    if format_name == "rtn_int4_asym":
+        return nBits_quantizer(bits=4, group_size=-1, sym=False)
     if format_name == "rtn_int8":
         return nBits_quantizer(bits=8, group_size=-1, sym=True)
     raise ValueError(f"GPTQ: unsupported weight format {format_name!r}")

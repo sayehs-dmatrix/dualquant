@@ -56,12 +56,12 @@ class Dualquant(QuantMethod):
             self.collected_scales[layer_key] = col_scales.detach().cpu()
         return col_scales
 
-    def save_scales(self, model_id, num_iter, out_dir):
+    def save_scales(self, model_id, num_iter, out_dir, scale_option="row_column", row_init="max_abs", col_init="l1_norm"):
         if not self.collected_scales:
             return None
         os.makedirs(out_dir, exist_ok=True)
         model_tag = model_id.replace("/", "_")
-        path = os.path.join(out_dir, f"DQ_{model_tag}_iter{num_iter}scales_rtn_int4_init_all_one_row_max_abs.pt")
+        path = os.path.join(out_dir, f"DQ_{model_tag}_iter{num_iter}_scale_{scale_option}_row_{row_init}_col_{col_init}_rtn_int4.pt")
         torch.save(self.collected_scales, path)
         return path
             

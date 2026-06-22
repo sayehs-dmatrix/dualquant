@@ -1,0 +1,34 @@
+# ──────────────────────────────────────────────────────────────
+# requirements.txt
+#
+# NOTE: Install PyTorch FIRST (separately), then run:
+#   pip install -r requirements.txt
+#
+# PyTorch — pick the line matching your CUDA version:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#   pip install torch torchvision torchaudio  # CPU only
+# ──────────────────────────────────────────────────────────────
+
+# HuggingFace stack
+transformers>=4.40.0
+datasets>=2.18.0
+accelerate>=0.27.0
+huggingface_hub>=0.21.0
+sentencepiece>=0.2.0
+tokenizers>=0.15.0
+
+# Numerics (pinned <2.0 for compatibility)
+numpy<2.0
+scipy>=1.12.0
+
+# Evaluation
+lm-eval==0.4.2
+
+# Utilities
+tqdm
+pandas
+protobuf
+ninja
+safetensors
+einops

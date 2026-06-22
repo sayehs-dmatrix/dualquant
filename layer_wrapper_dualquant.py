@@ -254,6 +254,8 @@ def _init_beta(block_matrix, beta_init):
         beta_stat = torch.sqrt((block_matrix ** 2).sum(dim=0)).clamp(min=1e-8)
     elif beta_init == "all_one":
         beta_stat = torch.ones(n_cols, device=block_matrix.device, dtype=block_matrix.dtype)
+    elif beta_init == "max_abs":
+        beta_stat = block_matrix.abs().max(dim=0).values.clamp(min=1e-8)
     else:
         raise ValueError(f"_init_beta: unsupported beta_init {beta_init!r}")
     return 1.0 / beta_stat
