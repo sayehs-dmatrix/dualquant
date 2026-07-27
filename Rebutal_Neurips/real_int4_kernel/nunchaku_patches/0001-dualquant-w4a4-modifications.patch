@@ -1,0 +1,1221 @@
+diff --git a/nunchaku/csrc/gemm.h b/nunchaku/csrc/gemm.h
+index 840f4d9..3a49e1a 100644
+--- a/nunchaku/csrc/gemm.h
++++ b/nunchaku/csrc/gemm.h
+@@ -5,14 +5,41 @@
+ #include "Linear.h"
+ #include "debug.h"
+ #include "module.h"
++#include "kernels/zgemm/zgemm.h"
++#include <ATen/cuda/CUDAContext.h>
++#include <vector>
++
++namespace nunchaku::kernels {
++void mul_broadcast_lastdim_bf16(const __nv_bfloat16 *x, const __nv_bfloat16 *beta, __nv_bfloat16 *out, long long numel, int K,
++                                 cudaStream_t stream);
++void* get_mul_broadcast_lastdim_bf16_kernel_ptr();
++int mul_broadcast_lastdim_bf16_launch_threads();
++}
+ 
+ class QuantizedGEMM : public ModuleWrapper<GEMM_W4A4> {
+ public:
+     void init(int64_t in_features, int64_t out_features, bool bias, bool bf16, int8_t deviceId) {
+         spdlog::info("Initializing QuantizedGEMM");
+-        
++
++        // cudaLimitStackSize is PER THREAD, and the driver reserves that much
++        // device memory for every resident thread on the GPU. Upstream sets
++        // 8192 B here, which on an RTX 4090 (128 SMs x ~1440 resident threads)
++        // reserves ~1.5 GB up front -- a fixed cost paid even by a 128x128
++        // layer, and ~20% of this model's reported INT4 footprint. It is not
++        // code size (the .so is 16.8 MB) and not kernel count (identical to
++        // the byte with 903 vs 1229 kernels compiled).
++        //
++        // Every kernel in this build reports STACK:0 under
++        // `cuobjdump -res-usage` (no kernel uses any stack frame at all), so
++        // the raised limit buys nothing here. Leave the CUDA default alone
++        // unless explicitly overridden.
++        if (const char *env = std::getenv("NUNCHAKU_STACK_SIZE")) {
++            size_t want = (size_t)std::strtoull(env, nullptr, 10);
++            if (want > 0) {
++                checkCUDA(cudaDeviceSetLimit(cudaLimitStackSize, want));
++            }
++        }
+         size_t val = 0;
+-        checkCUDA(cudaDeviceSetLimit(cudaLimitStackSize, 8192));
+         checkCUDA(cudaDeviceGetLimit(&val, cudaLimitStackSize));
+         spdlog::debug("Stack={}", val);
+ 
+@@ -22,18 +49,752 @@ public:
+     torch::Tensor forward(torch::Tensor x) {
+         checkModel();
+ 
+-        std::cerr << "QuantizedGEMM forward" << std::endl;
+-
+         x = x.contiguous();
+ 
+         Tensor result = net->forward(from_torch(x));
+-        
++
+         torch::Tensor output = to_torch(result);
+         Tensor::synchronizeDevice();
+ 
+         return output;
+     }
+ 
++    // ── Persistent-buffer fast path ─────────────────────────────────────────
++    // GEMM_W4A4::forward() (used by forward() above) calls quantize(), which
++    // calls Tensor::allocate() (== cudaMallocAsync) for act/ascales/lora_act
++    // on EVERY call, then frees them when the QuantizedActivation goes out of
++    // scope (cudaFreeAsync) -- plus forward_quant() allocates a fresh output
++    // tensor too. That's 4 cudaMallocAsync + 4 cudaFreeAsync calls per
++    // forward(), which dominates latency at LLM decode call volumes (M=1,
++    // hundreds of calls per token). Since M is constant across an
++    // autoregressive decode loop (or a fixed-shape prefill), we cache and
++    // reuse these buffers across calls instead of reallocating every time,
++    // replicating GEMM_W4A4::quantize()+forward_quant()'s EMPTY-fuse-path
++    // logic directly against the cached buffers (see Linear.cpp for the
++    // reference call this mirrors).
++    //
++    // SAFETY: the returned tensor aliases cached_out's storage; it stays
++    // valid until the NEXT forward_fast() call on this same instance (which
++    // is exactly the lifetime a normal sequential forward pass needs: the
++    // output is consumed by the next op before this layer is called again
++    // next token/step).
++    Tensor cached_act, cached_ascales, cached_lora_act, cached_out;
++    int cached_M = -1;
++    Tensor cached_beta_input;   // scratch buffer for x*beta, used by forward_beta only
++
++    // ── forward_static: designed to be legal INSIDE an OUTER CUDA graph
++    // capture that spans the whole model decode step (see
++    // whole_step_graph_decode.py). Requirements that forced a new method:
++    //   1. NO internal cudaStreamBeginCapture (forward_graph* would nest
++    //      captures -- illegal).
++    //   2. NO allocation during capture. nunchaku's Tensor::allocate calls
++    //      cudaMallocAsync on the LEGACY stream 0 (Tensor.h BufferCUDA), which
++    //      is illegal mid-capture. So all scratch is allocated on the first
++    //      (warm-up) call, and capture must happen at the SAME M.
++    //   3. Internal kernels must launch on the CAPTURE stream. nunchaku's own
++    //      getCurrentCUDAStream() reads its thread-local stackCUDAStreams
++    //      (empty => legacy stream 0), so this pushes PyTorch's current stream
++    //      (== the capture stream inside torch.cuda.graph) for the duration.
++    //      Without this the internal quantize/gemm kernels would go to stream
++    //      0 and either fail capture or be silently omitted from the graph --
++    //      the exact bug class already hit once in forward_graph.
++    //   4. NO to_torch() on the output: to_torch allocates a fresh torch
++    //      tensor AND does an extra device-to-device copy every call. Instead
++    //      the output torch tensor is allocated once and written in place, so
++    //      the graph bakes in a stable address and the caller reads results
++    //      from that same tensor after each replay.
++    Tensor cached_act_st, cached_ascales_st, cached_lora_act_st, cached_beta_input_st;
++    torch::Tensor out_torch_st;
++    int cached_M_st = -1, cached_actualM_st = -1;
++
++    torch::Tensor forward_static(torch::Tensor x, torch::Tensor beta) {
++        checkModel();
++        x = x.contiguous();
++        beta = beta.contiguous();
++        Tensor xt = from_torch(x);
++        Tensor betat = from_torch(beta);
++
++        const int actualM = (int)(xt.numel() / xt.shape[-1]);
++        const int K = (int)xt.shape[-1];
++        const int BLOCK_M = 128;
++        const int M = ceilDiv(actualM, BLOCK_M) * BLOCK_M;
++
++        Device dev = net->qweight.device();
++
++        // Allocation path -- MUST NOT be reached during an outer graph capture
++        // (cudaMallocAsync on legacy stream 0 is illegal there). Warm up with
++        // the same M before capturing.
++        if (M != cached_M_st || actualM != cached_actualM_st) {
++            cached_act_st = Tensor::allocate({M, net->in_features_pad / 2}, Tensor::INT8, dev);
++            cached_ascales_st = Tensor::allocate({net->in_features_pad / 64, M}, net->dtype, dev);
++            cached_lora_act_st = Tensor::allocate({M, net->lora_rank}, Tensor::FP32, dev);
++            cached_beta_input_st = Tensor::allocate({actualM, K}, xt.dtype(), dev);
++            out_torch_st = torch::empty(
++                {actualM, net->out_features},
++                torch::TensorOptions().dtype(x.scalar_type()).device(x.device())
++            );
++            cached_M_st = M;
++            cached_actualM_st = actualM;
++        }
++
++        cudaStream_t cur = at::cuda::getCurrentCUDAStream().stream();
++        stackCUDAStreams.push(cur);
++
++        // beta is applied INSIDE the quantize kernel (load_act_to_fpsum reads
++        // the activation from global memory and multiplies as it loads), so
++        // there is no separate elementwise multiply kernel here. At 224 linear
++        // layers per decode step that removes 224 kernels/step; with the whole
++        // decode step captured as one CUDA graph, per-kernel cost is GPU-side
++        // fixed overhead, which is what actually bounds this regime.
++        nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++            xt, cached_act_st, cached_ascales_st, net->lora_down, cached_lora_act_st, net->smooth, false, betat
++        );
++        Tensor outT = from_torch(out_torch_st);   // wraps existing storage; no allocation
++        nunchaku::kernels::gemm_w4a4(
++            cached_act_st, net->qweight, outT, {},
++            cached_ascales_st, net->wscales, {}, {},
++            cached_lora_act_st, net->lora_up, {}, {},
++            {}, {}, {},
++            net->bias, {}, {}, {},
++            false, net->lora_scales, false
++        );
++
++        stackCUDAStreams.pop();
++        return out_torch_st;
++    }
++
++    // ── forward_beta: fuses DualQuant's per-channel beta rescale into this
++    // one C++ call, instead of the caller doing `x * beta` as a separate
++    // Python-level aten::mul first. Profiling on the real model showed that
++    // separate multiply costs ~16.5us of CPU dispatch overhead per call
++    // (ATen dispatcher + autograd guard + device dispatch) for ~1.4us of
++    // actual GPU work -- at 224 linear layers/token that's ~8.5ms of a
++    // ~33ms decode step, i.e. the single largest CPU-side cost in the whole
++    // profile. NOTE: this does the multiply with a plain custom kernel
++    // (mul_broadcast_lastdim_bf16), NOT by routing beta through nunchaku's
++    // own "smooth" mechanism -- that path was already proven to corrupt
++    // accuracy on DualQuant's wide-dynamic-range beta (PPL 6.73 -> 26905).
++    torch::Tensor forward_beta(torch::Tensor x, torch::Tensor beta) {
++        checkModel();
++        x = x.contiguous();
++        beta = beta.contiguous();
++        Tensor xt = from_torch(x);
++        Tensor betat = from_torch(beta);
++
++        const int actualM = (int)(xt.numel() / xt.shape[-1]);
++        const int K = (int)xt.shape[-1];
++        const int BLOCK_M = 128;
++        const int M = ceilDiv(actualM, BLOCK_M) * BLOCK_M;
++
++        Device dev = net->qweight.device();
++
++        if (M != cached_M) {
++            cached_act = Tensor::allocate({M, net->in_features_pad / 2}, Tensor::INT8, dev);
++            cached_ascales = Tensor::allocate({net->in_features_pad / 64, M}, net->dtype, dev);
++            cached_lora_act = Tensor::allocate({M, net->lora_rank}, Tensor::FP32, dev);
++            cached_M = M;
++        }
++        if (!cached_beta_input.valid() || cached_beta_input.shape.dataExtent != xt.shape.dataExtent) {
++            cached_beta_input = Tensor::allocate(xt.shape.dataExtent, xt.dtype(), dev);
++        }
++
++        // Explicit stream: must match the stream quantize_w4a4_act_fuse_lora/
++        // gemm_w4a4 below actually run on (getCurrentCUDAStream()), since the
++        // legacy/default stream this kernel would otherwise launch on gives
++        // no implicit ordering guarantee against PyTorch's own (non-blocking)
++        // stream -- the same class of bug fixed for forward_graph's raw
++        // <<<>>> launches.
++        nunchaku::kernels::mul_broadcast_lastdim_bf16(
++            xt.data_ptr<__nv_bfloat16>(), betat.data_ptr<__nv_bfloat16>(),
++            cached_beta_input.data_ptr<__nv_bfloat16>(), xt.numel(), K,
++            at::cuda::getCurrentCUDAStream().stream()
++        );
++
++        nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++            cached_beta_input, cached_act, cached_ascales, net->lora_down, cached_lora_act, net->smooth, false
++        );
++
++        TensorShape outShape(xt.shape.dataExtent);
++        outShape[-1] = net->out_features;
++        if (!cached_out.valid() || cached_out.shape.dataExtent != outShape.dataExtent) {
++            cached_out = Tensor::allocate(outShape, net->dtype, dev);
++        }
++
++        nunchaku::kernels::gemm_w4a4(
++            cached_act, net->qweight, cached_out, {},
++            cached_ascales, net->wscales, {}, {},
++            cached_lora_act, net->lora_up, {}, {},
++            {}, {}, {},
++            net->bias, {}, {}, {},
++            false, net->lora_scales, false
++        );
++
++        return to_torch(cached_out);
++    }
++
++    torch::Tensor forward_fast(torch::Tensor x) {
++        checkModel();
++        x = x.contiguous();
++        Tensor xt = from_torch(x);
++
++        const int actualM = (int)(xt.numel() / xt.shape[-1]);
++        const int BLOCK_M = 128;  // must match GEMMConfig_W4A4::BLOCK_M in gemm_base.cuh
++        const int M = ceilDiv(actualM, BLOCK_M) * BLOCK_M;
++
++        Device dev = net->qweight.device();
++
++        if (M != cached_M) {
++            cached_act = Tensor::allocate({M, net->in_features_pad / 2}, Tensor::INT8, dev);
++            cached_ascales = Tensor::allocate({net->in_features_pad / 64, M}, net->dtype, dev);
++            cached_lora_act = Tensor::allocate({M, net->lora_rank}, Tensor::FP32, dev);
++            cached_M = M;
++        }
++
++        nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++            xt, cached_act, cached_ascales, net->lora_down, cached_lora_act, net->smooth, false
++        );
++
++        TensorShape outShape(xt.shape.dataExtent);
++        outShape[-1] = net->out_features;
++        if (!cached_out.valid() || cached_out.shape.dataExtent != outShape.dataExtent) {
++            cached_out = Tensor::allocate(outShape, net->dtype, dev);
++        }
++
++        nunchaku::kernels::gemm_w4a4(
++            cached_act, net->qweight, cached_out, {},          // act, wgt, out, qout
++            cached_ascales, net->wscales, {}, {},               // ascales, wscales, oscales, poolout
++            cached_lora_act, net->lora_up, {}, {},               // lora_act_in, lora_up, lora_down(next), lora_act_out(next)
++            {}, {}, {},                                          // norm_q, norm_k, rotary_emb
++            net->bias, {}, {}, {},                               // bias, smooth_factor(next), out_vk, out_linearattn
++            false, net->lora_scales, false                       // act_unsigned, lora_scales, fuse_silu
++        );
++
++        // NOTE: deliberately NOT calling Tensor::synchronizeDevice() here.
++        // That call is cudaDeviceSynchronize() -- a full blocking device-wide
++        // sync -- and forward()/quantize() call it after EVERY invocation.
++        // At LLM decode call volumes (hundreds of calls/token) that forced
++        // host-device round trip dominates latency (~30-90us fixed, regardless
++        // of M) and serializes work that would otherwise pipeline on the
++        // stream. All our kernels (and PyTorch's own ops) run on the default
++        // CUDA stream, so ordering is preserved without an explicit sync;
++        // PyTorch/the caller syncs naturally at the point a result is actually
++        // needed (e.g. .item(), .cpu(), or the timing harness's own sync).
++        return to_torch(cached_out);
++    }
++
++    // ── CUDA-graph fast path ────────────────────────────────────────────────
++    // forward_fast still pays two separate CPU->driver kernel-launch calls
++    // per forward (quantize_w4a4_act_fuse_lora, then gemm_w4a4). For small
++    // shapes (q/k/v/o_proj) that fixed launch overhead dominates over the
++    // actual (tiny) memory traffic -- measured ~13x the theoretical
++    // memory-bound time for k/v_proj. CUDA graphs capture the whole
++    // fixed-shape op sequence ONCE and replay it as a SINGLE driver call,
++    // removing that per-launch dispatch overhead.
++    //
++    // Graphs require fixed memory addresses for every op captured, but the
++    // input tensor's address changes every call (fresh activation from the
++    // model each token) -- so we copy the caller's input into our own
++    // persistent `cached_input` buffer first (a plain async memcpy, NOT
++    // part of the captured graph, source address is free to vary), then
++    // replay the captured graph, which only ever touches our own fixed
++    // buffers (cached_input/act/ascales/lora_act/out) and the model's
++    // weight tensors (qweight/wscales/smooth/bias, fixed for the module's
++    // lifetime).
++    Tensor cached_input;
++    int cached_actualM = -1;                // actual (unpadded) M cached_input was sized for
++    cudaGraphExec_t graphExec = nullptr;
++    int graphExec_M = -1;
++    cudaStream_t captureStream = nullptr;   // dedicated non-null stream (legacy/NULL stream 0 can't be captured)
++    cudaEvent_t inputReadyEvent = nullptr;  // PyTorch's stream -> captureStream handoff
++    cudaEvent_t outputReadyEvent = nullptr; // captureStream -> PyTorch's stream handoff
++
++    // Separate state for forward_graph_beta's "no-stream-switch" variant:
++    // captures directly on the CALLER's current stream (at::cuda::getCurrentCUDAStream()),
++    // instead of a dedicated captureStream + cross-stream events. Only valid
++    // when the caller's current stream is itself non-null (i.e. the caller
++    // put torch under a custom torch.cuda.Stream(), NOT the default legacy
++    // stream 0 -- stream 0 can never be captured). Kept separate from
++    // graphExec/cached_input above so this and forward_graph don't collide.
++    // Fully independent scratch buffers (NOT shared with forward_fast/forward_beta/
++    // forward_graph's cached_act/cached_ascales/cached_lora_act/cached_out/cached_M):
++    // those methods track their own buffers' current size via their own "cached_M"
++    // variable, so if forward_graph_beta reallocated the SHARED buffers to a
++    // different size, the other methods' size-tracking would be silently stale,
++    // and vice versa -- either direction corrupts data or (worse) leaves a
++    // captured graph's baked-in pointers referencing a freed/resized buffer.
++    // Confirmed via a cross-check test (forward_graph_beta interleaved with
++    // forward_beta on the same instance): sharing buffers broke on the first
++    // call after an interleave. Independent buffers cost nothing extra in
++    // practice since real usage picks ONE forward variant per module.
++    Tensor cached_input_ns;
++    Tensor cached_act_ns, cached_ascales_ns, cached_lora_act_ns, cached_out_ns;
++    int cached_actualM_ns = -1;
++    int cached_M_ns = -1;
++    cudaGraphExec_t graphExecNS = nullptr;
++    int graphExecNS_M = -1;
++    cudaStream_t graphExecNS_stream = nullptr;  // stream the current graphExecNS was captured on
++
++    // ── forward_graph_beta_fused: fold the beta-multiply INTO the captured
++    // graph too, instead of launching it separately every call. ────────────
++    // forward_graph_beta still pays 2 host-side launches/call: the mul
++    // kernel (outside the graph, since its INPUT address changes every
++    // call and a captured node's args are fixed at capture time) + the
++    // graph replay itself. Measured floor for small shapes (q/k/v/o_proj,
++    // M<=64): ~28-30us, matching BF16's OWN floor almost exactly -- i.e.
++    // launch/dispatch count, not bandwidth, is the wall.
++    //
++    // CUDA graphs support exactly this "same shape, different pointer"
++    // case via cudaGraphExecKernelNodeSetParams: update ONE captured
++    // kernel node's argument in place (a cheap driver-side operation, no
++    // new kernel dispatch) instead of issuing a whole separate launch.
++    // This folds mul+quantize+gemm into ONE graph, replayed via ONE
++    // cudaGraphLaunch, preceded by ONE (hopefully cheaper) SetParams call
++    // instead of a full kernel launch -- 2 host calls either way, but if
++    // SetParams is meaningfully cheaper than a kernel launch, this wins.
++    // Whether it actually is cheaper is exactly what needs measuring, not
++    // assuming -- hence a separate method, isolated buffers, validated
++    // independently before ever being wired into the model.
++    Tensor cached_input_nsf;
++    Tensor cached_act_nsf, cached_ascales_nsf, cached_lora_act_nsf, cached_out_nsf;
++    int cached_actualM_nsf = -1;
++    int cached_M_nsf = -1;
++    cudaGraphExec_t graphExecNSF = nullptr;
++    int graphExecNSF_M = -1;
++    cudaStream_t graphExecNSF_stream = nullptr;
++    cudaGraph_t templateGraphNSF = nullptr;  // kept alive: node handles below are only valid while it exists
++    cudaGraphNode_t mulNodeNSF = nullptr;
++    // Stable storage the mul kernel's cudaKernelNodeParams.kernelParams array
++    // points to -- SetParams copies the VALUES here into the graph node, so
++    // these must hold the CURRENT call's argument values at SetParams time.
++    const __nv_bfloat16* mulArgX_nsf = nullptr;
++    const __nv_bfloat16* mulArgBeta_nsf = nullptr;
++    __nv_bfloat16* mulArgOut_nsf = nullptr;
++    long long mulArgNumel_nsf = 0;
++    int mulArgK_nsf = 0;
++
++    torch::Tensor forward_graph_beta_fused(torch::Tensor x, torch::Tensor beta) {
++        checkModel();
++        x = x.contiguous();
++        beta = beta.contiguous();
++        Tensor xt = from_torch(x);
++        Tensor betat = from_torch(beta);
++
++        cudaStream_t cur = at::cuda::getCurrentCUDAStream().stream();
++        if (cur == nullptr) {
++            throw std::runtime_error(
++                "forward_graph_beta_fused requires a non-default CUDA stream -- wrap the "
++                "call site in `with torch.cuda.stream(s):` using a torch.cuda.Stream() instance."
++            );
++        }
++
++        const int actualM = (int)(xt.numel() / xt.shape[-1]);
++        const int K = (int)xt.shape[-1];
++        const int BLOCK_M = 128;
++        const int M = ceilDiv(actualM, BLOCK_M) * BLOCK_M;
++
++        Device dev = net->qweight.device();
++
++        if (cur != graphExecNSF_stream) {
++            if (graphExecNSF != nullptr) {
++                checkCUDA(cudaGraphExecDestroy(graphExecNSF));
++                graphExecNSF = nullptr;
++            }
++            if (templateGraphNSF != nullptr) {
++                checkCUDA(cudaGraphDestroy(templateGraphNSF));
++                templateGraphNSF = nullptr;
++            }
++            mulNodeNSF = nullptr;
++            graphExecNSF_M = -1;
++            graphExecNSF_stream = cur;
++        }
++
++        if (M != cached_M_nsf || actualM != cached_actualM_nsf) {
++            if (graphExecNSF != nullptr) {
++                checkCUDA(cudaGraphExecDestroy(graphExecNSF));
++                graphExecNSF = nullptr;
++            }
++            if (templateGraphNSF != nullptr) {
++                checkCUDA(cudaGraphDestroy(templateGraphNSF));
++                templateGraphNSF = nullptr;
++            }
++            mulNodeNSF = nullptr;
++            graphExecNSF_M = -1;
++            cached_act_nsf = Tensor::allocate({M, net->in_features_pad / 2}, Tensor::INT8, dev);
++            cached_ascales_nsf = Tensor::allocate({net->in_features_pad / 64, M}, net->dtype, dev);
++            cached_lora_act_nsf = Tensor::allocate({M, net->lora_rank}, Tensor::FP32, dev);
++            cached_input_nsf = Tensor::allocate({actualM, K}, xt.dtype(), dev);
++            cached_M_nsf = M;
++            cached_actualM_nsf = actualM;
++        }
++
++        TensorShape outShape(xt.shape.dataExtent);
++        outShape[-1] = net->out_features;
++        if (!cached_out_nsf.valid() || cached_out_nsf.shape.dataExtent != outShape.dataExtent) {
++            cached_out_nsf = Tensor::allocate(outShape, net->dtype, dev);
++        }
++
++        // Always refresh the storage the mul kernel node's params point to,
++        // BEFORE either capturing (first time) or updating via SetParams
++        // (subsequent calls) -- both read these member variables' current
++        // values, not the call's local xt/betat directly.
++        mulArgX_nsf = xt.data_ptr<__nv_bfloat16>();
++        mulArgBeta_nsf = betat.data_ptr<__nv_bfloat16>();
++        mulArgOut_nsf = cached_input_nsf.data_ptr<__nv_bfloat16>();
++        mulArgNumel_nsf = xt.numel();
++        mulArgK_nsf = K;
++
++        stackCUDAStreams.push(cur);
++
++        if (graphExecNSF == nullptr) {
++            // First-ever build for this (stream, M) combo: capture mul +
++            // quantize + gemm together, in ONE graph.
++            nunchaku::kernels::mul_broadcast_lastdim_bf16(
++                mulArgX_nsf, mulArgBeta_nsf, mulArgOut_nsf, mulArgNumel_nsf, mulArgK_nsf, cur
++            );
++            nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++                cached_input_nsf, cached_act_nsf, cached_ascales_nsf, net->lora_down, cached_lora_act_nsf, net->smooth, false
++            );
++            nunchaku::kernels::gemm_w4a4(
++                cached_act_nsf, net->qweight, cached_out_nsf, {},
++                cached_ascales_nsf, net->wscales, {}, {},
++                cached_lora_act_nsf, net->lora_up, {}, {},
++                {}, {}, {},
++                net->bias, {}, {}, {},
++                false, net->lora_scales, false
++            );
++            checkCUDA(cudaStreamSynchronize(cur));
++
++            checkCUDA(cudaStreamBeginCapture(cur, cudaStreamCaptureModeThreadLocal));
++            nunchaku::kernels::mul_broadcast_lastdim_bf16(
++                mulArgX_nsf, mulArgBeta_nsf, mulArgOut_nsf, mulArgNumel_nsf, mulArgK_nsf, cur
++            );
++            nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++                cached_input_nsf, cached_act_nsf, cached_ascales_nsf, net->lora_down, cached_lora_act_nsf, net->smooth, false
++            );
++            nunchaku::kernels::gemm_w4a4(
++                cached_act_nsf, net->qweight, cached_out_nsf, {},
++                cached_ascales_nsf, net->wscales, {}, {},
++                cached_lora_act_nsf, net->lora_up, {}, {},
++                {}, {}, {},
++                net->bias, {}, {}, {},
++                false, net->lora_scales, false
++            );
++            checkCUDA(cudaStreamEndCapture(cur, &templateGraphNSF));
++
++            // Find the mul kernel's node by matching its captured function
++            // pointer -- cudaGraphGetNodes doesn't guarantee submission
++            // order, so identify it by content, not position.
++            size_t numNodes = 0;
++            checkCUDA(cudaGraphGetNodes(templateGraphNSF, nullptr, &numNodes));
++            std::vector<cudaGraphNode_t> nodes(numNodes);
++            checkCUDA(cudaGraphGetNodes(templateGraphNSF, nodes.data(), &numNodes));
++            void* mulFunc = nunchaku::kernels::get_mul_broadcast_lastdim_bf16_kernel_ptr();
++            for (auto node : nodes) {
++                cudaGraphNodeType type;
++                checkCUDA(cudaGraphNodeGetType(node, &type));
++                if (type != cudaGraphNodeTypeKernel) continue;
++                cudaKernelNodeParams params;
++                if (cudaGraphKernelNodeGetParams(node, &params) == cudaSuccess && params.func == mulFunc) {
++                    mulNodeNSF = node;
++                    break;
++                }
++            }
++            if (mulNodeNSF == nullptr) {
++                throw std::runtime_error("forward_graph_beta_fused: could not locate mul kernel node in captured graph");
++            }
++
++            checkCUDA(cudaGraphInstantiate(&graphExecNSF, templateGraphNSF, 0));
++            graphExecNSF_M = M;
++            // NOTE: templateGraphNSF is deliberately NOT destroyed here --
++            // cudaGraphExecKernelNodeSetParams's `node` argument must come
++            // from the template graph the exec was instantiated from, and
++            // per the CUDA graphs API that handle is only valid while the
++            // template graph object is alive. Destroyed on next rebuild/dtor.
++        } else {
++            // Replay path: update just the mul node's pointer/size args in
++            // the ALREADY-INSTANTIATED graph, then launch the whole thing
++            // (mul + quantize + gemm) as a single cudaGraphLaunch.
++            void* kernelArgs[] = {
++                (void*)&mulArgX_nsf, (void*)&mulArgBeta_nsf, (void*)&mulArgOut_nsf,
++                (void*)&mulArgNumel_nsf, (void*)&mulArgK_nsf
++            };
++            cudaKernelNodeParams params = {};
++            params.func = nunchaku::kernels::get_mul_broadcast_lastdim_bf16_kernel_ptr();
++            const int threads = nunchaku::kernels::mul_broadcast_lastdim_bf16_launch_threads();
++            const long long blocksNeeded = (mulArgNumel_nsf + threads - 1) / threads;
++            params.gridDim = dim3((unsigned int)blocksNeeded, 1, 1);
++            params.blockDim = dim3(threads, 1, 1);
++            params.sharedMemBytes = 0;
++            params.kernelParams = kernelArgs;
++            params.extra = nullptr;
++            checkCUDA(cudaGraphExecKernelNodeSetParams(graphExecNSF, mulNodeNSF, &params));
++        }
++
++        checkCUDA(cudaGraphLaunch(graphExecNSF, cur));
++
++        at::Tensor result = to_torch(cached_out_nsf);
++        stackCUDAStreams.pop();
++        return result;
++    }
++
++    torch::Tensor forward_graph(torch::Tensor x) {
++        checkModel();
++        x = x.contiguous();
++        Tensor xt = from_torch(x);
++
++        const int actualM = (int)(xt.numel() / xt.shape[-1]);
++        const int BLOCK_M = 128;
++        const int M = ceilDiv(actualM, BLOCK_M) * BLOCK_M;
++
++        Device dev = net->qweight.device();
++
++        if (captureStream == nullptr) {
++            checkCUDA(cudaStreamCreateWithFlags(&captureStream, cudaStreamNonBlocking));
++            checkCUDA(cudaEventCreateWithFlags(&inputReadyEvent, cudaEventDisableTiming));
++            checkCUDA(cudaEventCreateWithFlags(&outputReadyEvent, cudaEventDisableTiming));
++        }
++
++        // cached_input's size depends on actualM (unpadded), NOT M (padded to
++        // BLOCK_M) -- e.g. actualM=1 and actualM=16 both pad to M=128, but
++        // need differently-sized input buffers. A change in EITHER forces a
++        // full recapture, since the graph was captured against cached_input's
++        // OLD address (reallocating changes that address, and quantize's
++        // padded-M path only handles rounding, not a genuinely different
++        // actualM baked into the captured kernel args).
++        if (M != cached_M || actualM != cached_actualM) {
++            graphExec_M = -1;   // force recapture below even if M is unchanged
++            cached_act = Tensor::allocate({M, net->in_features_pad / 2}, Tensor::INT8, dev);
++            cached_ascales = Tensor::allocate({net->in_features_pad / 64, M}, net->dtype, dev);
++            cached_lora_act = Tensor::allocate({M, net->lora_rank}, Tensor::FP32, dev);
++            cached_input = Tensor::allocate({actualM, xt.shape[-1]}, xt.dtype(), dev);
++            cached_M = M;
++            cached_actualM = actualM;
++        }
++
++        TensorShape outShape(xt.shape.dataExtent);
++        outShape[-1] = net->out_features;
++        if (!cached_out.valid() || cached_out.shape.dataExtent != outShape.dataExtent) {
++            cached_out = Tensor::allocate(outShape, net->dtype, dev);
++        }
++
++        // x was produced on PyTorch's current stream; make our dedicated
++        // stream wait for it before reading, instead of assuming a shared
++        // implicit stream (the legacy/NULL stream can't be captured at all,
++        // so we can no longer just reuse getCurrentCUDAStream()==0 here).
++        cudaStream_t torchStream = at::cuda::getCurrentCUDAStream().stream();
++        checkCUDA(cudaEventRecord(inputReadyEvent, torchStream));
++        checkCUDA(cudaStreamWaitEvent(captureStream, inputReadyEvent, 0));
++
++        // Copy caller's input into our persistent buffer on captureStream
++        // (address varies call to call; this op itself is NOT part of the
++        // captured graph).
++        checkCUDA(cudaMemcpyAsync(
++            cached_input.data_ptr<char>(), xt.data_ptr<char>(),
++            xt.numel() * xt.scalar_size(), cudaMemcpyDeviceToDevice, captureStream
++        ));
++
++        if (graphExec == nullptr || graphExec_M != M) {
++            if (graphExec != nullptr) {
++                checkCUDA(cudaGraphExecDestroy(graphExec));
++                graphExec = nullptr;
++            }
++
++            // Warm-up run OUTSIDE capture, ON captureStream: cudaFuncSetAttribute
++            // (called inside both kernels' launch paths, guarded by a static
++            // once-flag) is a host-side call forbidden during stream capture.
++            // Running the exact same call sequence once for real, uncaptured,
++            // forces that one-time setup to happen here instead of inside the
++            // graph. Push captureStream so nunchaku's internal
++            // getCurrentCUDAStream() (used by the kernel launch wrappers) picks
++            // it up instead of the default legacy stream; pop once both the
++            // warm-up AND the captured region are done.
++            stackCUDAStreams.push(captureStream);
++
++            nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++                cached_input, cached_act, cached_ascales, net->lora_down, cached_lora_act, net->smooth, false
++            );
++            nunchaku::kernels::gemm_w4a4(
++                cached_act, net->qweight, cached_out, {},
++                cached_ascales, net->wscales, {}, {},
++                cached_lora_act, net->lora_up, {}, {},
++                {}, {}, {},
++                net->bias, {}, {}, {},
++                false, net->lora_scales, false
++            );
++            checkCUDA(cudaStreamSynchronize(captureStream));
++
++            checkCUDA(cudaStreamBeginCapture(captureStream, cudaStreamCaptureModeThreadLocal));
++            nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++                cached_input, cached_act, cached_ascales, net->lora_down, cached_lora_act, net->smooth, false
++            );
++            nunchaku::kernels::gemm_w4a4(
++                cached_act, net->qweight, cached_out, {},
++                cached_ascales, net->wscales, {}, {},
++                cached_lora_act, net->lora_up, {}, {},
++                {}, {}, {},
++                net->bias, {}, {}, {},
++                false, net->lora_scales, false
++            );
++
++            stackCUDAStreams.pop();
++
++            cudaGraph_t graph;
++            checkCUDA(cudaStreamEndCapture(captureStream, &graph));
++            checkCUDA(cudaGraphInstantiate(&graphExec, graph, 0));
++            checkCUDA(cudaGraphDestroy(graph));
++            graphExec_M = M;
++        }
++
++        checkCUDA(cudaGraphLaunch(graphExec, captureStream));
++
++        // Signal completion back to PyTorch's stream so the returned tensor
++        // is safe to consume there without an explicit host-side sync.
++        checkCUDA(cudaEventRecord(outputReadyEvent, captureStream));
++        checkCUDA(cudaStreamWaitEvent(torchStream, outputReadyEvent, 0));
++
++        return to_torch(cached_out);
++    }
++
++    // forward_graph_beta: fused beta-multiply + CUDA-graph replay, captured
++    // DIRECTLY on the caller's current PyTorch stream (at::cuda::getCurrentCUDAStream()) --
++    // no dedicated captureStream, no cross-stream cudaEvent synchronization.
++    //
++    // An earlier version used a separate captureStream plus 2 cudaEvent
++    // record/wait pairs per call to hand off to/from PyTorch's stream (the
++    // same pattern forward_graph still uses). Measured end-to-end on the
++    // full Llama-3.1-8B decode loop, that version was SLOWER than plain
++    // forward_beta (26.2 vs 32.2 tok/s) despite being on par in isolated
++    // per-shape microbenchmarks: the 4 extra host-side event API calls per
++    // linear layer (x224 layers/token) cost more than the graph saved.
++    //
++    // Fix: this version captures on whatever stream is current at call time.
++    // PyTorch's OWN default stream is the legacy/null stream 0 in this build
++    // (confirmed: torch.cuda.current_stream().cuda_stream == 0), which CUDA
++    // forbids capturing -- so the caller MUST run under a custom
++    // `with torch.cuda.stream(s):` (any torch.cuda.Stream() is a real non-null
++    // stream) for this method to work. If the current stream is still the
++    // legacy stream 0, this throws rather than silently falling back to the
++    // slow path, since a silent fallback would hide exactly the mistake that
++    // makes this optimization pointless.
++    torch::Tensor forward_graph_beta(torch::Tensor x, torch::Tensor beta) {
++        checkModel();
++        x = x.contiguous();
++        beta = beta.contiguous();
++        Tensor xt = from_torch(x);
++        Tensor betat = from_torch(beta);
++
++        cudaStream_t cur = at::cuda::getCurrentCUDAStream().stream();
++        if (cur == nullptr) {
++            throw std::runtime_error(
++                "forward_graph_beta requires a non-default CUDA stream (the legacy/null "
++                "stream cannot be captured) -- wrap the call site in `with torch.cuda.stream(s):` "
++                "using a torch.cuda.Stream() instance."
++            );
++        }
++
++        const int actualM = (int)(xt.numel() / xt.shape[-1]);
++        const int K = (int)xt.shape[-1];
++        const int BLOCK_M = 128;
++        const int M = ceilDiv(actualM, BLOCK_M) * BLOCK_M;
++
++        Device dev = net->qweight.device();
++
++        if (cur != graphExecNS_stream) {
++            // Stream changed (or first call ever) -- any existing graph was
++            // captured against a different stream's execution context and
++            // must be rebuilt.
++            if (graphExecNS != nullptr) {
++                checkCUDA(cudaGraphExecDestroy(graphExecNS));
++                graphExecNS = nullptr;
++            }
++            graphExecNS_M = -1;
++            graphExecNS_stream = cur;
++        }
++
++        if (M != cached_M_ns || actualM != cached_actualM_ns) {
++            graphExecNS_M = -1;
++            cached_act_ns = Tensor::allocate({M, net->in_features_pad / 2}, Tensor::INT8, dev);
++            cached_ascales_ns = Tensor::allocate({net->in_features_pad / 64, M}, net->dtype, dev);
++            cached_lora_act_ns = Tensor::allocate({M, net->lora_rank}, Tensor::FP32, dev);
++            cached_input_ns = Tensor::allocate({actualM, K}, xt.dtype(), dev);
++            cached_M_ns = M;
++            cached_actualM_ns = actualM;
++        }
++
++        TensorShape outShape(xt.shape.dataExtent);
++        outShape[-1] = net->out_features;
++        if (!cached_out_ns.valid() || cached_out_ns.shape.dataExtent != outShape.dataExtent) {
++            cached_out_ns = Tensor::allocate(outShape, net->dtype, dev);
++        }
++
++        stackCUDAStreams.push(cur);
++        // Not part of the captured graph (input data differs every call) --
++        // runs on `cur` each call, then the graph (which reads cached_input_ns)
++        // is replayed on the SAME stream, so ordering is automatic: no event
++        // needed between this write and the graph's read, nor between the
++        // graph's write to cached_out_ns and the caller's next op consuming it.
++        nunchaku::kernels::mul_broadcast_lastdim_bf16(
++            xt.data_ptr<__nv_bfloat16>(), betat.data_ptr<__nv_bfloat16>(),
++            cached_input_ns.data_ptr<__nv_bfloat16>(), xt.numel(), K,
++            cur
++        );
++
++        if (graphExecNS == nullptr || graphExecNS_M != M) {
++            if (graphExecNS != nullptr) {
++                checkCUDA(cudaGraphExecDestroy(graphExecNS));
++                graphExecNS = nullptr;
++            }
++
++            nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++                cached_input_ns, cached_act_ns, cached_ascales_ns, net->lora_down, cached_lora_act_ns, net->smooth, false
++            );
++            nunchaku::kernels::gemm_w4a4(
++                cached_act_ns, net->qweight, cached_out_ns, {},
++                cached_ascales_ns, net->wscales, {}, {},
++                cached_lora_act_ns, net->lora_up, {}, {},
++                {}, {}, {},
++                net->bias, {}, {}, {},
++                false, net->lora_scales, false
++            );
++            checkCUDA(cudaStreamSynchronize(cur));
++
++            checkCUDA(cudaStreamBeginCapture(cur, cudaStreamCaptureModeThreadLocal));
++            nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++                cached_input_ns, cached_act_ns, cached_ascales_ns, net->lora_down, cached_lora_act_ns, net->smooth, false
++            );
++            nunchaku::kernels::gemm_w4a4(
++                cached_act_ns, net->qweight, cached_out_ns, {},
++                cached_ascales_ns, net->wscales, {}, {},
++                cached_lora_act_ns, net->lora_up, {}, {},
++                {}, {}, {},
++                net->bias, {}, {}, {},
++                false, net->lora_scales, false
++            );
++            cudaGraph_t graph;
++            checkCUDA(cudaStreamEndCapture(cur, &graph));
++            checkCUDA(cudaGraphInstantiate(&graphExecNS, graph, 0));
++            checkCUDA(cudaGraphDestroy(graph));
++            graphExecNS_M = M;
++        }
++
++        checkCUDA(cudaGraphLaunch(graphExecNS, cur));
++
++        // IMPORTANT: to_torch() is not a zero-copy wrap -- it allocates a
++        // fresh torch::Tensor and does an internal .copy_() that itself reads
++        // getCurrentCUDAStream() (this same nunchaku stack). Popping `cur`
++        // before this call left that copy running on stream 0, which has no
++        // ordering guarantee against `cur` (a non-blocking stream, per
++        // PyTorch's stream creation convention) -- the copy could read
++        // cached_out before this call's graph replay had written it,
++        // silently returning the PREVIOUS call's output instead (a
++        // reproducible one-call-lag bug, confirmed via debug_graph_beta_replay.py).
++        // Keep `cur` on the stack until after to_torch so its internal copy
++        // is correctly stream-ordered after the graph launch above.
++        at::Tensor result = to_torch(cached_out_ns);
++        stackCUDAStreams.pop();
++        return result;
++    }
++
+     std::string dumpTensorBF16(Tensor x) {
+         std::stringstream ss;
+         for (int i = 0; i < 256; i++) {
+@@ -88,6 +849,68 @@ public:
+         return ss.str();
+     }
+ 
++    // ── DualQuant adapter methods ──────────────────────────────────────────
++    // Pack a plain [N, K] fp16/bf16 weight into this kernel's native tiled
++    // INT4 layout + group scales, writing directly into net->qweight /
++    // net->wscales (shapes must match exactly -- no padding needed when
++    // N, K are already multiples of 128/64, true for Llama-3.1-8B shapes).
++    void load_weight(torch::Tensor w) {
++        checkModel();
++        w = w.contiguous();
++        Tensor input = from_torch(w);
++        nunchaku::kernels::quantize_w4a4_wgt(input, net->qweight, net->wscales);
++        Tensor::synchronizeDevice();
++    }
++
++    // DualQuant's per-input-channel activation rescale (beta), analogous to
++    // this kernel's "smooth" factor applied inside quantize().
++    void load_smooth(torch::Tensor s) {
++        checkModel();
++        net->smooth.copy_(from_torch(s.contiguous()));
++        Tensor::synchronizeDevice();
++    }
++
++    // Returns the ACTUAL packed activation operand fed to the INT4 GEMM, plus
++    // its per-64-group scales, so Python can verify end-to-end that the
++    // activation really is 4-bit (act is [M, in_features_pad/2] INT8 == exactly
++    // 4 bits per activation element) rather than taking it on faith.
++    std::vector<torch::Tensor> quantize_probe(torch::Tensor x, torch::Tensor beta) {
++        checkModel();
++        x = x.contiguous();
++        beta = beta.contiguous();
++        Tensor xt = from_torch(x);
++        Tensor betat = from_torch(beta);
++
++        const int actualM = (int)(xt.numel() / xt.shape[-1]);
++        const int M = ceilDiv(actualM, 128) * 128;
++        Device dev = net->qweight.device();
++
++        Tensor act = Tensor::allocate({M, net->in_features_pad / 2}, Tensor::INT8, dev);
++        Tensor ascales = Tensor::allocate({net->in_features_pad / 64, M}, net->dtype, dev);
++        Tensor lora_act = Tensor::allocate({M, net->lora_rank}, Tensor::FP32, dev);
++
++        nunchaku::kernels::quantize_w4a4_act_fuse_lora(
++            xt, act, ascales, net->lora_down, lora_act, net->smooth, false, betat
++        );
++        Tensor::synchronizeDevice();
++        return {to_torch(act), to_torch(ascales)};
++    }
++
++    // Bytes of persistent INT4 activation scratch this layer holds (the packed
++    // 4-bit activation operand + its scales), for honest activation-memory
++    // accounting. Uses the currently-cached M, i.e. the shape actually in use.
++    std::vector<int64_t> act_buffer_bytes() {
++        int64_t act_b = 0, asc_b = 0;
++        auto add = [&](const Tensor &t, int64_t &acc) {
++            if (t.valid() && t.numel() > 0) acc += (int64_t)t.numel() * (int64_t)t.scalar_size();
++        };
++        add(cached_act, act_b);      add(cached_ascales, asc_b);
++        add(cached_act_ns, act_b);   add(cached_ascales_ns, asc_b);
++        add(cached_act_st, act_b);   add(cached_ascales_st, asc_b);
++        add(cached_act_nsf, act_b);  add(cached_ascales_nsf, asc_b);
++        return {act_b, asc_b};
++    }
++
+     void quantize(torch::Tensor x, bool fuse_glu) {
+         checkModel();
+ 
+diff --git a/src/Linear.cpp b/src/Linear.cpp
+index f197e9a..084b6a9 100644
+--- a/src/Linear.cpp
++++ b/src/Linear.cpp
+@@ -320,7 +320,9 @@ Tensor GEMM_W4A4::forward_quant(QuantizedActivation qact) {
+ 
+ GEMM_W4A4::QuantizedActivation GEMM_W4A4::quantize(Tensor x, bool fuse_glu) {
+     const int actualM = x.numel() / x.shape[-1];
+-    const int M = ceilDiv(actualM, 256) * 256;
++    // NOTE: must match GEMMConfig_W4A4::BLOCK_M in gemm_base.cuh (currently 128,
++    // lowered from the original 256 for the DualQuant rebuttal decode-latency fix).
++    const int M = ceilDiv(actualM, 128) * 128;
+ 
+     // auto shape = TensorShape(x.shape.dataExtent);
+     // shape[-1] = in_features / 2;
+diff --git a/src/Tensor.h b/src/Tensor.h
+index dd53a00..a326581 100644
+--- a/src/Tensor.h
++++ b/src/Tensor.h
+@@ -76,6 +76,23 @@ public:
+     }
+ };
+ 
++// Set NUNCHAKU_SYNC_ALLOC=1 to allocate with plain cudaMalloc instead of
++// cudaMallocAsync. Motivation: the FIRST cudaMallocAsync on this device creates
++// the default memory pool and reserves a ~1.44 GB arena, regardless of the
++// requested size (measured: a 128x128 GEMM triggers the full 1.44 GB). On an 8B
++// model that fixed cost is ~20% of the reported INT4 footprint, and it is not
++// reclaimable via cudaMemPoolTrimTo (which only recovers ~0.15 GB). All of
++// nunchaku's device buffers here are long-lived (allocated once at load /
++// first-forward and then reused), so the async allocator's fast
++// alloc/free-in-a-stream advantage is not needed for them.
++inline bool nunchakuUseSyncAlloc() {
++    static const bool v = [] {
++        const char *e = std::getenv("NUNCHAKU_SYNC_ALLOC");
++        return e && e[0] == '1';
++    }();
++    return v;
++}
++
+ class BufferCUDA : public Buffer {
+ public:
+     BufferCUDA(size_t size) {
+@@ -84,18 +101,27 @@ public:
+         checkCUDA(cudaGetDevice(&this->device.idx));
+         if (size == 0) {
+             this->ptr = nullptr;
++            return;   // nothing to allocate; also avoids a pointless allocator call
++        }
++        if (nunchakuUseSyncAlloc()) {
++            checkCUDA(cudaMalloc(&this->ptr, size));
++        } else {
++            checkCUDA(cudaMallocAsync(&this->ptr, size, 0));    // use default stream to sync with all other streams
+         }
+-        checkCUDA(cudaMallocAsync(&this->ptr, size, 0));    // use default stream to sync with all other streams
+     }
+     virtual ~BufferCUDA() {
+         if (this->size == 0) {
+             assert(!this->ptr);
+             return;
+         }
+-        checkCUDA(cudaFreeAsync(this->ptr, 0));
++        if (nunchakuUseSyncAlloc()) {
++            checkCUDA(cudaFree(this->ptr));
++        } else {
++            checkCUDA(cudaFreeAsync(this->ptr, 0));
++        }
+     }
+-    virtual bool isAsyncBuffer() override { 
+-        return true;
++    virtual bool isAsyncBuffer() override {
++        return !nunchakuUseSyncAlloc();
+     }
+ };
+ 
+diff --git a/src/kernels/zgemm/gemm_base.cuh b/src/kernels/zgemm/gemm_base.cuh
+index 27583cd..fac9a23 100644
+--- a/src/kernels/zgemm/gemm_base.cuh
++++ b/src/kernels/zgemm/gemm_base.cuh
+@@ -30,8 +30,35 @@ template<bool bf16>
+ class GEMMConfig_W4A4 {
+ public:
+     // BE CAREFUL: weights need to be repacked when the tiling size changes
+-
+-    static constexpr int BLOCK_M = 256;
++    //
++    // DualQuant rebuttal experiment: BLOCK_M lowered 256->128 (WARP_M_TILES
++    // becomes 1 instead of 2, still a valid integer = WARP_M/INSN_M). Original
++    // BLOCK_M=256 was built for diffusion-model batch sizes; for LLM decode
++    // (M=1) it padded every activation-quantize call up to 256 rows, wasting
++    // >99% of the "quantized" grid on every single token. This is the
++    // documented floor of how far BLOCK_M can drop without also restructuring
++    // NUM_WARPS (going lower breaks WARP_M_TILES = WARP_M/INSN_M as an integer).
++
++    // BLOCK_N: at small M the grid is (ceilDiv(M,BLOCK_M), N/BLOCK_N), so with
++    // M=1 the only source of parallelism is N/BLOCK_N. Measured DRAM bandwidth
++    // (cold cache, 32 distinct weights, true GPU time inside a graph) appeared
++    // to track block count, which suggested the device was simply starved:
++    //     k/v_proj  N=1024   ->   8 blocks ->  7.8% of peak BW
++    //     q/o/down  N=4096   ->  32 blocks -> 30-34% of peak BW
++    //     gate/up   N=14336  -> 112 blocks -> 76.8% of peak BW
++    // cuBLAS BF16 reaches 900-965 GB/s on all of these.
++    //
++    // That hypothesis was TESTED AND REJECTED: halving BLOCK_N to 64 (doubling the block count on
++    // every shape) changed nothing -- down_proj went 90.69us -> 90.46us (0.2%),
++    // q/o 29.71 -> 29.57us. So small-M throughput is NOT block-count limited.
++    // What actually correlates is the K-loop length: down_proj (K=14336, 224
++    // K-iterations) gets 345 GB/s while gate/up (K=4096, 64 K-iterations) gets
++    // 828 GB/s for the SAME 31.2MB of weights. The fix is split-K (which cuBLAS
++    // GEMV does -- it hits 960 GB/s on down_proj), not retiling N. Kept at the
++    // upstream value since changing it buys nothing.
++    // (Note: BLOCK_N=32 is not even legal -- EpilogueQuantize needs
++    //  NUM_GROUPS = (BLOCK_N/INSN_N)/(INSN_K/INSN_N) >= 1.)
++    static constexpr int BLOCK_M = 128;
+     static constexpr int BLOCK_N = 128;
+     static constexpr int WARP_SIZE = 32;
+     static constexpr int NUM_WARPS = 8;
+diff --git a/src/kernels/zgemm/gemm_w4a4.cu b/src/kernels/zgemm/gemm_w4a4.cu
+index def7cdc..78bacaa 100644
+--- a/src/kernels/zgemm/gemm_w4a4.cu
++++ b/src/kernels/zgemm/gemm_w4a4.cu
+@@ -3,14 +3,26 @@
+ 
+ namespace nunchaku::kernels {
+ 
++// NUNCHAKU_BF16_ONLY: skip instantiating the entire FP16 W4A4 CUTLASS template
++// tree. This build only ever runs BF16 (DualQuant's weights and activations are
++// loaded as BF16), so the FP16 tree is 327 dead kernels out of 1229 -- and the
++// number of kernels in the loaded module is what drives a fixed ~1.5 GB of
++// device memory the driver reserves at first use (it is NOT code size: the .so
++// is only 16.8 MB; and NOT local memory: STACK is 0 for every kernel).
++// Dropping unused specializations is therefore a direct memory win.
+ template<typename F>
+ static void invoke_launch(Tensor::ScalarType dtype, F &&launch) {
++#ifndef NUNCHAKU_BF16_ONLY
+     if (dtype == Tensor::FP16) {
+         launch.template operator()<GEMMConfig_W4A4_FP16>();
+-    } else if (dtype == Tensor::BF16) {
++    } else
++#endif
++    if (dtype == Tensor::BF16) {
+         launch.template operator()<GEMMConfig_W4A4_BF16>();
+     } else {
+-        assert(false);
++        throw std::runtime_error(
++            "gemm_w4a4: unsupported dtype (this build is BF16-only; rebuild without "
++            "-DNUNCHAKU_BF16_ONLY to enable FP16)");
+     }
+ }
+ 
+@@ -72,10 +84,10 @@ void linearattn_vk_mul_q(Tensor q, Tensor vk) {
+     });
+ }
+ 
+-void quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Tensor lora_down, Tensor lora_act_out, Tensor smooth, bool fuse_glu) {
++void quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Tensor lora_down, Tensor lora_act_out, Tensor smooth, bool fuse_glu, Tensor beta) {
+     invoke_launch(input.dtype(), [&]<typename Config>() {
+         GEMM_W4A4_Launch<Config>::quantize_w4a4_act_fuse_lora(
+-            input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu
++            input, output, oscales, lora_down, lora_act_out, smooth, fuse_glu, beta
+         );
+     });
+ }
+diff --git a/src/kernels/zgemm/gemm_w4a4.cuh b/src/kernels/zgemm/gemm_w4a4.cuh
+index ccec20a..53c1154 100644
+--- a/src/kernels/zgemm/gemm_w4a4.cuh
++++ b/src/kernels/zgemm/gemm_w4a4.cuh
+@@ -193,8 +193,21 @@ public:
+         using matrix_t = half_t[WARP_M][WARP_N + 8];
+         static constexpr size_t SHMEM_SIZE = sizeof(matrix_t);
+ 
++        // `beta_natural` (optional): DualQuant's per-input-channel activation
++        // rescale, in PLAIN [K] layout, already offset by the caller's column
++        // offset. Multiplying it in here -- while the activation is being read
++        // from global memory anyway -- removes a whole separate elementwise
++        // kernel per linear layer (224 of them per decode step).
++        // NOTE: deliberately NOT routed through the existing `smooth_factor`
++        // mechanism: smooth is consumed by EpilogueQuantize via
++        // load_wscale/broadcast_wscale, i.e. in the PACKED wscale layout with
++        // a lane-permuted access pattern, so writing beta there in natural
++        // order applies it to the wrong channels (that mistake previously
++        // took full-model PPL from 6.73 to 26905). Here the indexing is the
++        // same natural column indexing as `input`, so it is unambiguous.
+         __device__ __forceinline__
+-        void operator()(const half_t *input, int stride, int maxRows, int maxCols, fpsum_warp &out, void *shmem) {
++        void operator()(const half_t *input, int stride, int maxRows, int maxCols, fpsum_warp &out, void *shmem,
++                        const half_t *beta_natural = nullptr) {
+             const int laneId = threadIdx.x % WARP_SIZE;
+ 
+             matrix_t &mat = *reinterpret_cast<matrix_t *>(shmem);
+@@ -203,6 +216,13 @@ public:
+             using packed_input = std::array<half_t, PACK_SIZE>;
+             using packed_raw_input = std::array<half2_t, PACK_SIZE>;
+ 
++            // Per-warp column slice is the same for every row, so load beta once.
++            packed_input beta_pack;
++            beta_pack.fill(half_t(1));
++            if (beta_natural != nullptr && laneId * PACK_SIZE < maxCols) {
++                beta_pack = load(reinterpret_cast<const packed_input *>(beta_natural + laneId * PACK_SIZE));
++            }
++
+         #pragma unroll
+             for (int row = 0; row < WARP_M; row++) {
+                 packed_input pack;
+@@ -225,6 +245,12 @@ public:
+                         pack = load(reinterpret_cast<const packed_input *>(input + row * stride + laneId * PACK_SIZE));
+                     }
+                 }
++                if (beta_natural != nullptr) {
++                #pragma unroll
++                    for (int j = 0; j < PACK_SIZE; j++) {
++                        pack[j] = pack[j] * beta_pack[j];
++                    }
++                }
+                 store<true>(reinterpret_cast<packed_input *>(&mat[row][laneId * PACK_SIZE]), pack);
+             }
+             __syncwarp();
+@@ -949,6 +975,7 @@ public:
+                 packed_ascale_t *oscales;
+                 const packed_fpsum_t *lora_wgt_down;
+                 float *lora_act;
++                const half_t *beta_natural;  // optional DualQuant per-channel act rescale, plain [K] layout
+ 
+                 // aligned to BLOCK_M and BLOCK_N
+                 int M, N;   // N should be the actual K in the next GEMM (needs /2 if fuse_glu)
+@@ -983,8 +1010,8 @@ public:
+                     args.actualM - m_offset,
+                     args.actualN - n_offset,
+                     fpsum,
+-                    shmem + warpId * SHMEM_PER_WARP
+-                    // args.smooth_factor ? args.smooth_factor + n_offset : nullptr
++                    shmem + warpId * SHMEM_PER_WARP,
++                    args.beta_natural ? args.beta_natural + n_offset : nullptr
+                 );
+ 
+                 CHECK_NAN(fpsum, "fpsum");
+diff --git a/src/kernels/zgemm/gemm_w4a4_launch.cuh b/src/kernels/zgemm/gemm_w4a4_launch.cuh
+index 16daf2e..5d1da91 100644
+--- a/src/kernels/zgemm/gemm_w4a4_launch.cuh
++++ b/src/kernels/zgemm/gemm_w4a4_launch.cuh
+@@ -40,7 +40,7 @@ public:
+         std::vector<float> lora_scales,  // [R / 16]
+         bool fuse_silu
+     );
+-    static void quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Tensor lora_down, Tensor lora_act_out, Tensor smooth, bool fuse_glu);
++    static void quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Tensor lora_down, Tensor lora_act_out, Tensor smooth, bool fuse_glu, Tensor beta = {});
+     static void quantize_w4a4_act(Tensor input, Tensor output, Tensor oscales);
+     static void quantize_w4a4_wgt(Tensor input, Tensor output, Tensor oscales);
+ 
+diff --git a/src/kernels/zgemm/gemm_w4a4_launch_impl.cuh b/src/kernels/zgemm/gemm_w4a4_launch_impl.cuh
+index 7b121a2..05e6dc7 100644
+--- a/src/kernels/zgemm/gemm_w4a4_launch_impl.cuh
++++ b/src/kernels/zgemm/gemm_w4a4_launch_impl.cuh
+@@ -86,11 +86,25 @@ void GEMM_W4A4_Launch<GEMMConfig_W4A4_FP16>::gemm_w4a4(
+                 bool,
+                 bool>;
+ 
++            // NOTE: cudaFuncSetAttribute is a host-side function-attribute call,
++            // not a stream operation -- CUDA graph capture forbids it entirely.
++            // It's idempotent (same attribute value every call for this template
++            // instantiation), so guard it with a static flag: set once outside
++            // any capture, skipped on every subsequent (possibly captured) call.
+             if (shmem >= 24 * 1024) {
+-                checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
++                static bool shmemAttrSet = false;
++                if (!shmemAttrSet) {
++                    checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem));
++                    shmemAttrSet = true;
++                }
+             }
+-            
+-            func<<<grid, GEMM::WARP_SIZE * GEMM::NUM_WARPS, shmem>>>(
++
++            // NOTE: explicit stream (getCurrentCUDAStream(), not the implicit
++            // legacy default stream 0) -- required for this launch to be
++            // capturable in a CUDA graph on any non-null stream, and for
++            // correct ordering when the caller (e.g. PyTorch) is itself using
++            // a non-default stream.
++            func<<<grid, GEMM::WARP_SIZE * GEMM::NUM_WARPS, shmem, getCurrentCUDAStream()>>>(
+                 act.data_ptr<packed_act_t>(),
+                 wgt.data_ptr<packed_wgt_t>(),
+                 ascales.data_ptr<packed_ascale_t>(),
+@@ -326,7 +340,7 @@ void GEMM_W4A4_Launch<Config>::linearattn_vk_mul_q(Tensor q, Tensor vk) {
+ }
+ 
+ template<typename Config>
+-void GEMM_W4A4_Launch<Config>::quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Tensor lora_down, Tensor lora_act_out, Tensor smooth, bool fuse_glu) {
++void GEMM_W4A4_Launch<Config>::quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Tensor lora_down, Tensor lora_act_out, Tensor smooth, bool fuse_glu, Tensor beta) {
+     const int actualM = input.numel() / input.shape[-1];
+     const int actualN = input.shape[-1];
+ 
+@@ -348,7 +362,13 @@ void GEMM_W4A4_Launch<Config>::quantize_w4a4_act_fuse_lora(Tensor input, Tensor
+     assert(lora_act_out.shape[0] == M);
+     assert(lora_act_out.shape[1] == rank);
+ 
+-    lora_act_out.zero_();
++    // NOTE: zero_() uses plain cudaMemset -- implicit legacy stream 0
++    // (regardless of getCurrentCUDAStream()), forbidden during graph capture,
++    // and on rank==0 (no LoRA, our case) this zeroes 0 bytes: a real API
++    // call for literally no effect. Skip entirely when there's nothing to zero.
++    if (lora_act_out.numel() > 0) {
++        lora_act_out.zero_();
++    }
+ 
+     dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
+ 
+@@ -359,11 +379,18 @@ void GEMM_W4A4_Launch<Config>::quantize_w4a4_act_fuse_lora(Tensor input, Tensor
+ 
+             auto func = invoke_kernel<kernel, typename kernel::Arguments>;
+ 
+-            checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
++            // See the analogous guard in gemm_w4a4's launch above: this
++            // host-side call is disallowed during CUDA graph capture, and is
++            // idempotent, so only pay it once per template specialization.
++            static bool shmemAttrSet = false;
++            if (!shmemAttrSet) {
++                checkCUDA(cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, kernel::SHMEM_SIZE));
++                shmemAttrSet = true;
++            }
+ 
+             // log(std::format("quantize_w4a4_act_fuse_lora M={} N={} input={} output={} (size={} numel={})", M, N, input.data_ptr(), output.data_ptr(), output.buffer->getSize(), output.numel()));
+ 
+-            func<<<grid, GEMM::WARP_SIZE * GEMM::NUM_WARPS, kernel::SHMEM_SIZE>>>(
++            func<<<grid, GEMM::WARP_SIZE * GEMM::NUM_WARPS, kernel::SHMEM_SIZE, getCurrentCUDAStream()>>>(
+                 typename kernel::Arguments{
+                     .input = input.data_ptr<half_t>(),
+                     .smooth_factor = smooth.valid() ? smooth.data_ptr<packed_wscale_t>() : nullptr,
+@@ -371,6 +398,7 @@ void GEMM_W4A4_Launch<Config>::quantize_w4a4_act_fuse_lora(Tensor input, Tensor
+                     .oscales = oscales.data_ptr<packed_ascale_t>(),
+                     .lora_wgt_down = lora_down.data_ptr<packed_fpsum_t>(),
+                     .lora_act = lora_act_out.data_ptr<float>(),
++                    .beta_natural = beta.valid() ? beta.data_ptr<half_t>() : nullptr,
+                     .M = M,
+                     .N = N,
+                     .actualM = actualM,
+diff --git a/src/kernels/zgemm/zgemm.h b/src/kernels/zgemm/zgemm.h
+index 388d10c..f90953c 100644
+--- a/src/kernels/zgemm/zgemm.h
++++ b/src/kernels/zgemm/zgemm.h
+@@ -31,7 +31,7 @@ void gemm_w4a4(
+ );
+ void linearattn_vk_mul_q(Tensor q, Tensor vk);
+ 
+-void quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Tensor lora_down, Tensor lora_act_out, Tensor smooth = {}, bool fuse_glu = false);
++void quantize_w4a4_act_fuse_lora(Tensor input, Tensor output, Tensor oscales, Tensor lora_down, Tensor lora_act_out, Tensor smooth = {}, bool fuse_glu = false, Tensor beta = {});
+ void quantize_w4a4_act(Tensor input, Tensor output, Tensor oscales);
+ void quantize_w4a4_wgt(Tensor input, Tensor output, Tensor oscales);
+ 

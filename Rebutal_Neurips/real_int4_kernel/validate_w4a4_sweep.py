@@ -11,7 +11,7 @@ import sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_KERNEL_DIR = ("/home/coder/numrd/Quantization_Repo_July2025/"
+_KERNEL_DIR = ("/root/numrd/Quantization_Repo_July2025/"
                "MSE_Reduction_Two_approache_All_DataFormats_20260410/"
                "__Baselines_with_the_same_fils_as_MSE/DualScale_Kernel_Benchmark")
 for p in (_CODEBASE_ROOT, _KERNEL_DIR, _HERE):

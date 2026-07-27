@@ -15,7 +15,7 @@ import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_KERNEL_DIR = ("/home/coder/numrd/Quantization_Repo_July2025/"
+_KERNEL_DIR = ("/root/numrd/Quantization_Repo_July2025/"
                "MSE_Reduction_Two_approache_All_DataFormats_20260410/"
                "__Baselines_with_the_same_fils_as_MSE/DualScale_Kernel_Benchmark")
 for p in (_CODEBASE_ROOT, _KERNEL_DIR, _HERE):
@@ -30,6 +30,8 @@ from main import load_model, build_cfg, _load_all_hyperparams, evaluate_ppl, _AT
 from methods import make_method
 from fused_dual_scale_kernel import pack_int4_weights
 from fused_w4a4_kernel import fused_w4a4_gemm
+from e2e_bench_utils import prefill_bench, decode_bench
+from wrap_cache import wrap_cached
 
 METHOD_CFG = os.path.join(_CODEBASE_ROOT, "configs", "methods.json")
 GROUP_SIZE = 64   # matches block_size=64, the default used for the paper's reported PPL numbers
@@ -79,7 +81,7 @@ def convert_model_to_real_kernel(model, cfg):
             if K % GROUP_SIZE != 0:
                 print(f"  [SKIP kernel-conv] layer{layer_idx}.{proj_name}: K={K} not div by {GROUP_SIZE}")
                 continue
-            beta = method.wrap(module, cfg, layer_key=f"layer{layer_idx}.{proj_name}")
+            beta = wrap_cached(method, module, cfg, f"layer{layer_idx}.{proj_name}", cfg["_model_id"], GROUP_SIZE)
             real_module = RealW4A4Linear(module.weight.detach(), beta.detach())
             setattr(parent, proj_name, real_module)
         for proj_name in _MLP_NAMES:
@@ -89,7 +91,7 @@ def convert_model_to_real_kernel(model, cfg):
             if K % GROUP_SIZE != 0:
                 print(f"  [SKIP kernel-conv] layer{layer_idx}.{proj_name}: K={K} not div by {GROUP_SIZE}")
                 continue
-            beta = method.wrap(module, cfg, layer_key=f"layer{layer_idx}.{proj_name}")
+            beta = wrap_cached(method, module, cfg, f"layer{layer_idx}.{proj_name}", cfg["_model_id"], GROUP_SIZE)
             real_module = RealW4A4Linear(module.weight.detach(), beta.detach())
             setattr(parent, proj_name, real_module)
         print(f"  layer {layer_idx}/{n_layers} converted to real W4A4 kernel", flush=True)
@@ -100,12 +102,14 @@ def main():
     p.add_argument("--model", default="meta-llama/Llama-3.2-1B")
     p.add_argument("--nsamples", type=int, default=128)
     p.add_argument("--seqlen", type=int, default=2048)
+    p.add_argument("--skip-ppl", action="store_true")
     cli = p.parse_args()
 
     dev = torch.device("cuda:0")
     args = _make_args(cli.model, cli.nsamples, cli.seqlen)
     all_hp = _load_all_hyperparams(args.method_cfg)
     cfg = build_cfg(args, all_hp)
+    cfg["_model_id"] = cli.model
 
     print(f"Loading {cli.model}...")
     model = load_model(cli.model)
@@ -117,32 +121,33 @@ def main():
     convert_model_to_real_kernel(model, cfg)
     print(f"Conversion done in {time.time()-t0:.1f}s")
 
+    torch.cuda.reset_peak_memory_stats()
     model.to(dev).eval()
+    torch.cuda.synchronize()
+    weights_mem_gb = torch.cuda.memory_allocated() / 1e9
+    print(f"GPU memory after loading packed W4A4 weights: {weights_mem_gb:.3f}GB")
 
-    print("\nRunning real PPL evaluation (wikitext) through the real kernel...")
-    ppl = evaluate_ppl(model, tokenizer, args)
-    print(f"\nReal-kernel W4A4 PPL: {ppl}")
+    if not cli.skip_ppl:
+        print("\nRunning real PPL evaluation (wikitext) through the real kernel...")
+        ppl = evaluate_ppl(model, tokenizer, args)
+        print(f"\nReal-kernel W4A4 PPL: {ppl}")
+    else:
+        print("\n[skip-ppl] skipping PPL evaluation")
 
-    # ── Real generation throughput/latency/memory ──
+    # ── Real prefill latency/throughput/memory (compute/bandwidth-bound, batch>1) ──
     prompt = "The quick brown fox jumps over the lazy dog. " * 8
     ids = tokenizer(prompt, return_tensors="pt").input_ids.to(dev)
-    with torch.no_grad():
-        for _ in range(1):
-            model.generate(ids, max_new_tokens=100, do_sample=False,
-                            pad_token_id=tokenizer.eos_token_id)
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        t0 = time.time()
-        n_tokens = 0
-        for _ in range(3):
-            out = model.generate(ids, max_new_tokens=100, do_sample=False,
-                                  pad_token_id=tokenizer.eos_token_id)
-            n_tokens += out.shape[1] - ids.shape[1]
-        torch.cuda.synchronize()
-        elapsed = time.time() - t0
-    peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9
-    print(f"\nReal-kernel generation: tokens/sec={n_tokens/elapsed:.2f}  "
-          f"latency/call={elapsed/3:.3f}s  peak_mem={peak_mem_gb:.3f}GB")
+    for bs in (1, 16):
+        r = prefill_bench(model, ids, batch_size=bs)
+        print(f"\nReal-kernel prefill (batch={bs}, seq_len={r['seq_len']}): "
+              f"latency={r['latency_ms']:.3f}ms  tokens/sec={r['tokens_per_sec']:.1f}  "
+              f"peak_mem={r['peak_mem_gb']:.3f}GB")
+
+    # ── Real decode generation throughput/latency/memory (batch=1, autoregressive) ──
+    d = decode_bench(model, ids, tokenizer)
+    print(f"\nReal-kernel decode generation: tokens/sec={d['tokens_per_sec']:.2f}  "
+          f"latency/call={d['latency_per_call_s']:.3f}s  peak_mem={d['peak_mem_gb']:.3f}GB  "
+          f"weights_mem={weights_mem_gb:.3f}GB")
 
 
 if __name__ == "__main__":
