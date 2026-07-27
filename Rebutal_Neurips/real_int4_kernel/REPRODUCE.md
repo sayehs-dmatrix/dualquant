@@ -1,8 +1,20 @@
 # Reproducing the end-to-end W4A4 results
 
 Everything needed to regenerate the numbers in `RESULTS_end_to_end.md` (and therefore
-`REVIEWER_RESPONSE_draft.md`) from a clean machine. Results were produced on a single
-**NVIDIA RTX 4090 (24 GB)**, CUDA 12.6 driver, Linux.
+`REVIEWER_RESPONSE_draft.md`) from a clean machine.
+
+The exact environment used is recorded in **`ENVIRONMENT.txt`**: RTX 4090 (24 GB), driver
+560.35.03, CUDA toolkit 12.6, Python 3.12.13, torch 2.6.0+cu124, transformers 4.46.3,
+triton 3.2.0.
+
+> **IMPORTANT — paths.** The scripts were developed with the patched kernel built under a
+> scratch directory, so several files hard-code that location. After building, fix them:
+> ```bash
+> grep -rln "/tmp/claude-0" .          # lists every file needing the edit
+> grep -rl  "/tmp/claude-0" . | xargs sed -i "s|/tmp/claude-0/[^\"']*/svdquant_repo|<your svdquant path>|g"
+> ```
+> The value must end at the directory containing
+> `build/lib.linux-x86_64-cpython-312/nunchaku_min*.so`.
 
 ---
 
@@ -45,6 +57,8 @@ git clone --recursive https://github.com/dbw6/svdquant.git
 cd svdquant
 git checkout e9ad053
 git submodule update --init --recursive          # cutlass, json, mio, spdlog
+# exact submodule commits used are recorded in nunchaku_patches/submodule_pins.txt
+# (cutlass a75b4ac matters: the W4A4 kernel is built against it)
 
 PATCHES=<path to>/real_int4_kernel/nunchaku_patches
 
@@ -130,7 +144,7 @@ python profile_breakdown.py --mode int4
 
 ```bash
 # activation operand is exactly 4.00 bits/element, 16 levels in [-8,7]
-python <scratch>/verify_act_int4.py
+python verification/verify_act_int4.py
 
 # INT4 tensor-core instruction is actually emitted
 cuobjdump -sass <svdquant>/build/lib.linux-x86_64-cpython-312/nunchaku_min*.so \
@@ -152,6 +166,19 @@ cuobjdump -sass <svdquant>/build/lib.linux-x86_64-cpython-312/nunchaku_min*.so \
 | `full_model_nunchaku.py` | model conversion (`NunchakuW4A4Linear`) imported by the above |
 | `wrap_cache.py` | disk cache for DualQuant BCD output |
 | `bf16_baseline_e2e.py`, `e2e_bench_utils.py` | BF16 baseline model construction and shared helpers |
+
+**Verification / diagnostic scripts** (in `verification/`, run after fixing paths as above):
+
+| Script | Checks |
+|---|---|
+| `verify_act_int4.py` | activation operand is exactly 4.00 bits/element, 16 levels in [-8,7] |
+| `test_awq_real_layer.py` | SQNR of the packed path vs FP32 on a real cached DualQuant layer (19.0 dB) |
+| `test_forward_graph_beta_ns_correctness.py`, `test_forward_fast_correctness.py` | correctness of the graph / fast GEMM entry points across M and repeated calls |
+| `test_pershape_gpu.py` | true per-shape GPU time and bandwidth, cold cache, 32 distinct weights |
+| `split_quant_gemm.py` | splits each layer's cost into quantize vs GEMM |
+| `ceiling_analysis.py` | achieved TOP/s and GB/s vs BF16 across M |
+| `test_multistream.py` | the rejected multi-stream overlap experiment (0.79x) |
+| `test_awq_gemv_repack.py`, `test_fused_speed.py`, `debug_offbyone.py` | AWQ packing validation, fused-beta timing, PPL harness off-by-one check |
 
 **Superseded — kept for history, do not use for reported numbers:**
 `whole_step_graph_decode.py` (decode-only precursor to `graph_bench_all.py`),

@@ -1,0 +1,9 @@
+=== INT4 real packed kernel PPL (wikitext, seqlen=2048) ===
+Running real PPL evaluation (wikitext) through nunchaku kernel...
+    ppl = evaluate_ppl(model, tokenizer, args)
+  File "/root/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/main.py", line 277, in evaluate_ppl
+=== BF16 baseline PPL (wikitext, seqlen=2048) ===
+Running real PPL evaluation (wikitext) on the BF16 model...
+    ppl = evaluate_ppl(model, tokenizer, args)
+  File "/root/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/main.py", line 277, in evaluate_ppl
+=== DONE ===
