@@ -113,6 +113,18 @@ independent of which GEMM kernel consumes it.
 If `wrap_cache/` is already populated (224 `.pt` files for Llama-3.1-8B), skip ahead. To
 build it from scratch, just run any of the commands in §4 once and let it populate.
 
+**The cache is deliberately not committed** (~15 GB, excluded by the `*.pt` rule in
+`Quantization_Repo_July2025/.gitignore`) and it does not need to be: the BCD path contains
+no randomness — no `manual_seed`, no `random`/`randn` anywhere in `methods/dualquant.py` or
+`methods/base.py` — so it is a deterministic function of the weights and regenerates
+bit-identically. The cache key is a plain SHA1 of (model_id, layer_key, block_size), and the
+PPL data loader is called with an explicit `seed=0`. Regenerating therefore reproduces the
+reported numbers exactly, at a one-time cost of ~35–70 min.
+
+All in-repo dependencies the scripts import are tracked: `main.py`, the `methods/`,
+`preprocess/`, `legacy_vendor/`, `formats/`, `activations/`, `quarot/`, `smoothquant/`
+packages, `configs/methods.json`, and the `_legacy_path.py` sys.path shim.
+
 ---
 
 ## 4. Commands that produce each reported number
