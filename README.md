@@ -42,7 +42,7 @@ dualquant/
 │   └── smoothquant/             #   smooth_with_scale_dict.smooth_lm
 ├── blockfmt/                    # indirection to the block-format library (see Requirements)
 ├── configs/methods.json         # one merged file with per-method hyperparams
-├── results/                     # per-model PPL CSVs from run_sweep.sh
+├── results/                     # created at runtime: per-model PPL CSVs from run_sweep.sh
 ├── scales_dualquant_rtn_int4/   # saved dualquant column scales (.pt)
 ├── scales_smoothquant_rtn_int4/ # saved SmoothQuant scales (.pt)
 ├── vendor/                      # third-party code kept in-tree to stay self-contained
@@ -51,8 +51,11 @@ dualquant/
 └── README.md
 ```
 
-Not tracked (regenerable, and large): `hessian_cache/`, `scale_cache/`,
-`ablation/real_int4_kernel/wrap_cache/`.
+Not tracked (regenerable): `hessian_cache/`, `scale_cache/`,
+`ablation/real_int4_kernel/wrap_cache/`, and all measured outputs — the result
+CSVs, plots and logs that `main.py`, `run_sweep.sh` and the `ablation/` scripts
+write. The code and the plotting scripts are included so every number in the
+paper can be regenerated; the recorded outputs themselves are not shipped.
 
 ## Requirements
 

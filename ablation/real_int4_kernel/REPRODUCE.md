@@ -1,7 +1,8 @@
 # Reproducing the end-to-end W4A4 results
 
-Everything needed to regenerate the numbers in `RESULTS_end_to_end.md` (and therefore
-`REVIEWER_RESPONSE_draft.md`) from a clean machine.
+Everything needed to regenerate the end-to-end W4A4 numbers reported in the paper
+(accuracy, memory, latency/throughput) from a clean machine. Measured outputs are not
+checked in; the commands below produce them.
 
 The exact environment used is recorded in **`ENVIRONMENT.txt`**: RTX 4090 (24 GB), driver
 560.35.03, CUDA toolkit 12.6, Python 3.12.13, torch 2.6.0+cu124, transformers 4.46.3,
