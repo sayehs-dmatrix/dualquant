@@ -66,7 +66,17 @@ TEXT_RULES: list[tuple[str, str, str]] = [
     (r"\binternal GitLab\b", "an internal package index", "internal host"),
     (r"\b[\w.+-]+@d-matrix\.ai\b", "anonymous@example.com", "corporate e-mail"),
     (r"\bd-matrix\.ai\b", "example.com", "corporate domain"),
+    # venue: keep paths consistent with DIR_RENAMES above
+    (r"\bRebutal_Neurips\b", "rebuttal", "venue in path"),
+    (r"\bNeurIPS\b", "the venue", "venue name"),
 ]
+
+# Directory renames applied to the copy. The venue is not author-identifying,
+# but the artifact should not advertise which submission it belongs to.
+# Format names (SFP4, SBFP12, ...) are deliberately NOT renamed: they appear in
+# tracked result filenames and scale tensors, so aliasing them would break
+# provenance against the recorded results.
+DIR_RENAMES = {"Rebutal_Neurips": "rebuttal"}
 
 SKIP_DIRS = {".git", "__pycache__", "hessian_cache", "scale_cache", "wrap_cache",
              "tools"}
@@ -164,7 +174,9 @@ def main() -> int:
     for rel in filter(None, files):
         if rel.startswith("tools/"):
             continue                      # this script must not ship
-        dst = os.path.join(a.out, rel)
+        parts = rel.split("/")
+        parts = [DIR_RENAMES.get(p, p) for p in parts]
+        dst = os.path.join(a.out, *parts)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(os.path.join(HERE, rel), dst)
 
