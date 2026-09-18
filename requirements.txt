@@ -1,34 +1,80 @@
-# ──────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # requirements.txt
 #
-# NOTE: Install PyTorch FIRST (separately), then run:
-#   pip install -r requirements.txt
+# Pins are the versions of a environment in which the DualQuant pipeline was
+# actually run end-to-end after this repo was made standalone:
 #
-# PyTorch — pick the line matching your CUDA version:
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-#   pip install torch torchvision torchaudio  # CPU only
-# ──────────────────────────────────────────────────────────────
+#   python main.py --model Qwen/Qwen3-0.6B --method dualquant \
+#       --method-cfg configs/methods.json --weight-fmt nvfp4 \
+#       --weight-block-size 16 --tasks wikitext
+#   -> 28/28 layers quantised, WikiText-2 PPL 20.5191
+#
+# Verified on Python 3.11.14, Linux, CUDA 13.0 (NVIDIA GH200).
+# Only packages the code actually imports are listed; see the audit note at the
+# bottom for what was deliberately left out.
+#
+# Install PyTorch FIRST, matching your CUDA version, then `pip install -r`:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu130   # or cu124 / cu121
+# ─────────────────────────────────────────────────────────────────────────────
 
-# HuggingFace stack
-transformers>=4.40.0
-datasets>=2.18.0
-accelerate>=0.27.0
-huggingface_hub>=0.21.0
-sentencepiece>=0.2.0
-tokenizers>=0.15.0
+# ── Core: required for any dualquant / rtn / gptq / awq / sinq run ───────────
+torch==2.13.0                  # install separately, see header
+transformers==5.15.0
+datasets==2.21.0
+accelerate==1.14.0
+huggingface-hub==1.27.0
+tokenizers==0.22.2
+safetensors==0.8.0
+numpy==1.26.4                  # <2.0: the legacy_vendor/ code assumes NumPy 1.x
+scipy==1.17.1
+tqdm==4.70.0
 
-# Numerics (pinned <2.0 for compatibility)
-numpy<2.0
-scipy>=1.12.0
+# ── Evaluation (main.py --tasks, main_downstream.py) ─────────────────────────
+lm_eval==0.4.13
 
-# Evaluation
-lm-eval==0.4.2
+# ── d-Matrix internal, NOT on PyPI ───────────────────────────────────────────
+# `from dmx.compressor import Format` is imported by formats/mx.py,
+# formats/nvfp4.py and layer_wrapper_dualquant.py, so it is REQUIRED for every
+# run -- the repo does not work without it. Install from the internal GitLab:
+#   pip install -e /path/to/dmx-compressor          # tested with 0.3.0
+# dmx-compressor==0.3.0
 
-# Utilities
-tqdm
-pandas
-protobuf
-ninja
-safetensors
-einops
+# ── Optional: only needed for specific code paths ────────────────────────────
+# --preprocess quarot, and activations/perm_linear.py:
+#   pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git
+# fast-hadamard-transform
+
+matplotlib>=3.8 ; python_version >= "3.9"   # Rebutal_Neurips plotting scripts only
+pandas==3.0.5                                # result-table scripts only
+
+# Triton W4A4 path (Rebutal_Neurips/real_int4_kernel/fused_w4a4_kernel.py).
+# Ships with the CUDA torch wheels; listed for visibility, not installed twice.
+# triton==3.7.1
+
+# The packed-INT4 kernel path (Rebutal_Neurips/real_int4_kernel/) additionally
+# needs `nunchaku_min`, which is BUILT, not pip-installed: apply
+# nunchaku_patches/0001-dualquant-w4a4-modifications.patch to upstream nunchaku
+# at the commit in nunchaku_patches/submodule_pins.txt, build with
+# nunchaku_patches/new_files/setup_minimal.py, then point NUNCHAKU_DIR at the
+# resulting build/lib.* directory. Requires an Ada (sm_89) GPU, e.g. RTX 4090.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Audit notes
+#
+# * Dropped from the previous file (not imported anywhere in the tree):
+#   sentencepiece, protobuf, ninja, einops. `ninja` is only needed if you build
+#   the nunchaku kernel, which has its own instructions above.
+#
+# * gemlite is imported only by vendor/dualscale_kernel_benchmark/, inside a
+#   try/except, and is not required by anything this repo runs.
+#
+# * quarot/vendor/rotation_utils.py imports `quant_utils` and `monkeypatch`,
+#   which are modules from the upstream QuaRot repo that were never vendored
+#   here. That code path is therefore broken independently of packaging --
+#   it was already broken before this repo was extracted.
+#
+# * legacy_vendor/datautils.py calls load_dataset('wikitext', ...). Namespace-
+#   less dataset ids are rejected by huggingface-hub >= 1.0; use
+#   'Salesforce/wikitext' (already present as a commented-out line there) if you
+#   hit `HfUriError`.
+# ─────────────────────────────────────────────────────────────────────────────
