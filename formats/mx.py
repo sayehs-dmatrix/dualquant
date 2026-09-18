@@ -1,7 +1,7 @@
 """MX-spec formats (block_size configurable; default 32):
    mxfp4 (E2M1), mxint4, mxfp8_e4m3, mxfp8_e5m2, mxint8.
 
-`cast` uses dmx.compressor's Format.cast — applies an internal E8M0 block
+`cast` uses blockfmt's Format.cast — applies an internal E8M0 block
 scale + element quant.
 `cast_element_only` does the element quant only (no internal block scale);
 the caller is responsible for any per-row/per-col scaling.
@@ -10,7 +10,7 @@ the caller is responsible for any per-row/per-col scaling.
 import _legacy_path  # noqa: F401
 
 import torch
-from dmx.compressor import Format
+from blockfmt import Format
 from torch_quant import float_to_fp4
 
 from .base import FormatSpec

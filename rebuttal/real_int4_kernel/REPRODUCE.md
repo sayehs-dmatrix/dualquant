@@ -10,8 +10,8 @@ triton 3.2.0.
 > **IMPORTANT — paths.** The scripts were developed with the patched kernel built under a
 > scratch directory, so several files hard-code that location. After building, fix them:
 > ```bash
-> grep -rln "/tmp/claude-0" .          # lists every file needing the edit
-> grep -rl  "/tmp/claude-0" . | xargs sed -i "s|/tmp/claude-0/[^\"']*/svdquant_repo|<your svdquant path>|g"
+> grep -rln "<BUILD_DIR>" .          # lists every file needing the edit
+> grep -rl  "<BUILD_DIR>" . | xargs sed -i "s|<BUILD_DIR>"']*/svdquant_repo|<your svdquant path>|g"
 > ```
 > The value must end at the directory containing
 > `build/lib.linux-x86_64-cpython-312/nunchaku_min*.so`.
@@ -24,7 +24,7 @@ The pinned versions matter — a newer `transformers` breaks this legacy codebas
 mismatched torch/CUDA build silently produces a torch that cannot run on the driver.
 
 ```bash
-source /venv/main/bin/activate          # or your own venv
+source <VENV>          # or your own venv
 
 pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 pip install triton==3.2.0
@@ -34,7 +34,7 @@ pip install accelerate sentencepiece datasets
 
 Two traps worth knowing:
 
-- Installing `dmx-compressor` pulls a `torch` built for cu130, which will not run on this
+- Installing `blockfmt` pulls a `torch` built for cu130, which will not run on this
   driver. If you install it, reinstall torch afterwards with the command above.
 - `transformers` 4.46.3 is required. `StaticCache`'s signature and the Llama attention
   internals used by the CUDA-graph harness differ in later versions.
@@ -133,7 +133,7 @@ Run each twice and take the second (warm) run: the first pass leaves GPU clocks 
 (verify with `nvidia-smi --query-gpu=clocks.sm --format=csv`: ~2745 MHz warm vs ~210 MHz idle).
 
 ```bash
-cd Quantization_Repo_July2025/Dualquant_codebase_20260508/Rebutal_Neurips/real_int4_kernel
+cd Quantization_Repo_July2025/Dualquant_codebase_20260508/rebuttal/real_int4_kernel
 
 # §1 Accuracy — WikiText-2 PPL at the paper's 8192 setting
 python ppl_eval.py --mode bf16 --seqlen 8192      # -> 5.61

@@ -32,26 +32,26 @@ tqdm==4.70.0
 # ── Evaluation (main.py --tasks, main_downstream.py) ─────────────────────────
 lm_eval==0.4.13
 
-# ── d-Matrix internal, NOT on PyPI ───────────────────────────────────────────
-# `from dmx.compressor import Format` is imported by formats/mx.py,
+# ── the vendor internal, NOT on PyPI ───────────────────────────────────────────
+# `from blockfmt import Format` is imported by formats/mx.py,
 # formats/nvfp4.py and layer_wrapper_dualquant.py, so it is REQUIRED for every
-# run -- the repo does not work without it. Install from the internal GitLab:
-#   pip install -e /path/to/dmx-compressor          # tested with 0.3.0
-# dmx-compressor==0.3.0
+# run -- the repo does not work without it. Install from the an internal package index:
+#   pip install -e /path/to/blockfmt          # tested with 0.3.0
+# blockfmt==0.3.0
 
 # ── Optional: only needed for specific code paths ────────────────────────────
 # --preprocess quarot, and activations/perm_linear.py:
 #   pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git
 # fast-hadamard-transform
 
-matplotlib>=3.8 ; python_version >= "3.9"   # Rebutal_Neurips plotting scripts only
+matplotlib>=3.8 ; python_version >= "3.9"   # rebuttal plotting scripts only
 pandas==3.0.5                                # result-table scripts only
 
-# Triton W4A4 path (Rebutal_Neurips/real_int4_kernel/fused_w4a4_kernel.py).
+# Triton W4A4 path (rebuttal/real_int4_kernel/fused_w4a4_kernel.py).
 # Ships with the CUDA torch wheels; listed for visibility, not installed twice.
 # triton==3.7.1
 
-# The packed-INT4 kernel path (Rebutal_Neurips/real_int4_kernel/) additionally
+# The packed-INT4 kernel path (rebuttal/real_int4_kernel/) additionally
 # needs `nunchaku_min`, which is BUILT, not pip-installed: apply
 # nunchaku_patches/0001-dualquant-w4a4-modifications.patch to upstream nunchaku
 # at the commit in nunchaku_patches/submodule_pins.txt, build with

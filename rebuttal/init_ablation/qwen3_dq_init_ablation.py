@@ -1,10 +1,12 @@
-"""Init-sensitivity ablation for Dualquant on Llama-3.2-1B.
+"""Init-sensitivity ablation for Dualquant on Qwen3-0.6B.
 
-Parallel to qwen3_dq_init_ablation.py. For each Dualquant init variant we
-have, compare against the corresponding SmoothQuant scales (α=0.5 and α=0.0)
-and against each other.
+For each Dualquant init variant we have, compare against the corresponding
+SmoothQuant scales (α=0.5 and α=0.0) and against each other. The point is
+to check whether choosing col_init / row_init materially changes either:
+  - the saved DQ `1/β` itself                 (DQ-vs-DQ pairwise)
+  - the agreement between DQ and SmoothQuant  (SQ-vs-DQ, per variant)
 
-Standalone — no imports from the other Rebutal_Neurips scripts. Disposable.
+Standalone — no imports from the other rebuttal scripts. Disposable.
 """
 
 import os
@@ -12,22 +14,18 @@ import torch
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
 
-import os as _os
-_DQ_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(
-    _os.path.abspath(__file__))))  # repo root, resolved from this file
-
 # ── Config ──────────────────────────────────────────────────────────────────
-MODEL  = "meta-llama_Llama-3.2-1B"
+MODEL  = "meta-llama_Llama-3.1-8B"
 SQ_DIR = _os.path.join(_DQ_ROOT, "scales_smoothquant_rtn_int4")
 DQ_DIR = _os.path.join(_DQ_ROOT, "scales_dualquant_rtn_int4")
 
 # DQ init tags — filename is `DQ_{MODEL}_iter15scales_rtn_int4_init_{tag}.pt`
-# Note: Llama-3.2-1B files use the explicit `row_max_abs` / `row_all_one` naming.
 DQ_TAGS = [
-    "l1Norm",                # col=l1_norm, row=max_abs (original)
-    "l1Norm_row_max_abs",    # col=l1_norm, row=max_abs (re-run, explicit)
-    "l1Norm_row_all_one",    # col=l1_norm, row=all_one
-    "all_one_row_max_abs",   # col=all_one, row=max_abs
+    "l1Norm",               # col=l1_norm, row=max_abs (original)
+    "l1Norm_maxabs",        # col=l1_norm, row=max_abs (re-run)
+    "l1Norm_row_all_one",   # col=l1_norm, row=all_one
+    "all_one_maxabs",       # col=all_one, row=max_abs
+    "all_one_all_one",      # col=all_one, row=all_one
 ]
 
 proj_map = {
@@ -95,7 +93,9 @@ print()
 
 # ── Computation: mean correlations over layers ─────────────────────────────
 def mean_sq_vs_dq(sq_dict, dq_dict, sq_use_perproj=True):
-    """For each projection, return mean(P, logP, S) over all layers."""
+    """For each projection, return mean(P, logP, S) over all layers
+       between `sq_dict[<sq_key>]` and `dq_dict[<dq_key>]`.
+       sq_use_perproj=True picks the per-projection SQ key; False picks shared (block)."""
     out = {}
     for proj, (block, sq_pp, dq_suffix) in proj_map.items():
         sq_suffix = sq_pp if sq_use_perproj else block
@@ -124,6 +124,7 @@ def mean_dq_vs_dq(dq_a, dq_b):
 
 # ── Print helpers ──────────────────────────────────────────────────────────
 def print_sq_vs_dq(title, sq_dict, sq_use_perproj, metric):
+    """metric = 'P' | 'logP' | 'S' """
     label = {"P": "Pearson", "logP": "Log-Pearson", "S": "Spearman"}[metric]
     print("=" * 92)
     print(f"{title}  —  {label} (mean over {NUM_LAYERS} layers)")
@@ -142,16 +143,11 @@ def print_sq_vs_dq(title, sq_dict, sq_use_perproj, metric):
 # ── Tables ─────────────────────────────────────────────────────────────────
 print_sq_vs_dq("[B]  SQ α=0.5 per-proj vs DQ", sq05, sq_use_perproj=True,  metric="P")
 print_sq_vs_dq("[B]  SQ α=0.5 per-proj vs DQ", sq05, sq_use_perproj=True,  metric="logP")
-print_sq_vs_dq("[B]  SQ α=0.5 per-proj vs DQ", sq05, sq_use_perproj=True,  metric="S")
 
 print_sq_vs_dq("[D]  SQ α=0   per-proj vs DQ  (weight-only baseline)",
                sq00, sq_use_perproj=True,  metric="P")
-print_sq_vs_dq("[D]  SQ α=0   per-proj vs DQ  (weight-only baseline)",
-               sq00, sq_use_perproj=True,  metric="S")
 
 print_sq_vs_dq("[C]  SQ α=0.5 shared   vs DQ", sq05, sq_use_perproj=False, metric="P")
-print_sq_vs_dq("[C]  SQ α=0.5 shared   vs DQ", sq05, sq_use_perproj=False, metric="S")
-
 
 # ── DQ ↔ DQ init-sensitivity matrix ───────────────────────────────────────
 tags = list(dq_variants.keys())
@@ -167,5 +163,89 @@ for ta in tags:
         cells.append(f"{v:>18.4f}")
     print(f"{ta:<22} | " + " ".join(cells))
 print()
+
+
+# ── PDF output: color-coded heatmaps for the init-ablation ───────────────────
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+
+import os as _os
+_DQ_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))  # repo root, resolved from this file
+
+
+def _build_sq_vs_dq_matrix(sq_dict, sq_use_perproj, metric):
+    """Return (n_variants × n_projs) np.ndarray of mean correlations."""
+    M = np.zeros((len(tags), len(proj_map)))
+    for i, tag in enumerate(tags):
+        row = mean_sq_vs_dq(sq_dict, dq_variants[tag], sq_use_perproj=sq_use_perproj)
+        for j, p in enumerate(proj_map):
+            M[i, j] = row[p][metric]
+    return M
+
+
+def _build_dq_dq_matrix():
+    """(n_variants × n_variants) DQ↔DQ pairwise mean Pearson."""
+    n = len(tags)
+    M = np.zeros((n, n))
+    for i, ta in enumerate(tags):
+        for j, tb in enumerate(tags):
+            M[i, j] = 1.0 if ta == tb else mean_dq_vs_dq(dq_variants[ta], dq_variants[tb])
+    return M
+
+
+def _heatmap_page(pdf, mat, row_labels, col_labels, title, vmin=-1.0, vmax=1.0,
+                  cmap="RdBu_r", fmt="{:+.3f}"):
+    fig, ax = plt.subplots(figsize=(max(7, 0.9 * len(col_labels) + 4),
+                                    max(3.5, 0.55 * len(row_labels) + 2)))
+    im = ax.imshow(mat, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+    for i in range(mat.shape[0]):
+        for j in range(mat.shape[1]):
+            v = mat[i, j]
+            color = "white" if abs(v) > 0.55 else "black"
+            ax.text(j, i, fmt.format(v), ha="center", va="center",
+                    color=color, fontsize=9)
+    ax.set_xticks(range(len(col_labels)))
+    ax.set_xticklabels(col_labels, rotation=20, ha="right", fontsize=9)
+    ax.set_yticks(range(len(row_labels)))
+    ax.set_yticklabels(row_labels, fontsize=9)
+    ax.set_title(title, fontsize=10, pad=12)
+    cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02)
+    cbar.set_label("correlation", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+    plt.tight_layout()
+    pdf.savefig(fig, bbox_inches="tight")
+    plt.close(fig)
+
+
+_OUT_PDF = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    f"dq_init_ablation_{MODEL}.pdf",
+)
+projs = list(proj_map.keys())
+
+with PdfPages(_OUT_PDF) as pdf:
+    _heatmap_page(pdf,
+        _build_sq_vs_dq_matrix(sq05, sq_use_perproj=True,  metric="P"),
+        row_labels=tags, col_labels=projs,
+        title=f"{MODEL}  —  [B] SQ α=0.5 per-proj vs DQ  (Pearson, mean over {NUM_LAYERS} layers)")
+    _heatmap_page(pdf,
+        _build_sq_vs_dq_matrix(sq05, sq_use_perproj=True,  metric="logP"),
+        row_labels=tags, col_labels=projs,
+        title=f"{MODEL}  —  [B] SQ α=0.5 per-proj vs DQ  (Log-Pearson, mean over {NUM_LAYERS} layers)")
+    _heatmap_page(pdf,
+        _build_sq_vs_dq_matrix(sq00, sq_use_perproj=True,  metric="P"),
+        row_labels=tags, col_labels=projs,
+        title=f"{MODEL}  —  [D] SQ α=0 per-proj vs DQ  (weight-only baseline, Pearson)")
+    _heatmap_page(pdf,
+        _build_sq_vs_dq_matrix(sq05, sq_use_perproj=False, metric="P"),
+        row_labels=tags, col_labels=projs,
+        title=f"{MODEL}  —  [C] SQ α=0.5 shared vs DQ  (Pearson, mean over {NUM_LAYERS} layers)")
+    _heatmap_page(pdf,
+        _build_dq_dq_matrix(),
+        row_labels=tags, col_labels=tags,
+        title=f"{MODEL}  —  [F] DQ ↔ DQ pairwise mean Pearson")
+
+print(f"Wrote heatmap PDF: {_OUT_PDF}")
 
 print("done.")

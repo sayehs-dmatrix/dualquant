@@ -2,7 +2,7 @@
 
 import _legacy_path  # noqa: F401
 
-from dmx.compressor import Format
+from blockfmt import Format
 from torch_quant import float_to_fp4
 
 from .base import FormatSpec

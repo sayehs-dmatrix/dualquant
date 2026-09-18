@@ -13,7 +13,7 @@ from torch_quant import (
 from sinq_functions import wrap_layer_with_sinq_method
 from awq import *
 
-from dmx.compressor import Format
+from blockfmt import Format
 
 
 E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
@@ -248,7 +248,7 @@ def wrap_sinq_layer(layer, layer_activations, quant_method, act_quant_flag, bloc
 ################################################################################
 # GPTQ class — copied from:
 #   GPTQ_to_Be_Applied/My_Llama_GPTQ_SFP4_vs_SBFP12/
-#   The_Working_GPTQ_for_Llama_20250912/gptq_dmx_comprss_sfp4_vs_sbfp12.py
+#   The_Working_GPTQ_for_Llama_20250912/gptq_blockfmt.py
 ################################################################################
 
 DEBUG = False
@@ -309,7 +309,7 @@ class GPTQ:
         W = self.layer.weight.data.clone()
         if isinstance(self.layer, nn.Conv2d):
             W = W.flatten(1)
-        ##### dmx_compressor does not have this ################################
+        ##### blockfmt does not have this ################################
         if isinstance(self.layer, transformers.Conv1D):
             W = W.t()
         W = W.float()
@@ -436,11 +436,11 @@ class GPTQ:
 ################################################################################
 # Quantizer classes for GPTQ
 # sfp4 / sfp4_e5m3 : delegate to functions imported from torch_quant.py
-# all other formats : delegate to Format.from_shorthand(...).cast() from dmx.compressor
+# all other formats : delegate to Format.from_shorthand(...).cast() from blockfmt
 ################################################################################
 
 class sfp4_quantizer_cls(nn.Module):
-    """SFP4 with E4M4 block scale (d-Matrix sfp4)."""
+    """SFP4 with E4M4 block scale (the vendor sfp4)."""
     def __init__(self, block_size=16):
         super().__init__()
         self.blocksize = 16   # SFP4 always uses 16-element blocks
@@ -490,7 +490,7 @@ class sfp4_e5m3_quantizer_cls(nn.Module):
 
 
 class _FormatQuantizer(nn.Module):
-    """Wraps Format.from_shorthand(...).cast() for all dmx.compressor formats.
+    """Wraps Format.from_shorthand(...).cast() for all blockfmt formats.
     find_params is a no-op: Format.cast() computes scale and quantizes in one call."""
     def __init__(self, shorthand):
         super().__init__()
@@ -594,13 +594,13 @@ class nBits_quantizer:
 #   fasterquant), but packaged as a single layer wrapper function.
 #
 # Quantizer mapping:
-#   sfp4      -> sfp4_quantizer_cls         (d-Matrix SFP4, E4M4 block scale from torch_quant)
-#   nvfp4     -> nvfp4_quantizer_cls        (NVIDIA FP4,  NVFP4[E2M1]{16} via dmx.compressor)
-#   mxfp4     -> mxfp4_quantizer_cls        (MX FP4,      MXFP4[E2M1]{block} via dmx.compressor)
-#   mxint4    -> mxint4_quantizer_cls       (MX INT4,     MXINT4{block} via dmx.compressor)
-#   mxint8    -> mxint8_quantizer_cls       (MX INT8,     MXINT8{block} via dmx.compressor)
-#   mxfp8_e4m3 -> mxfp8_e4m3_quantizer_cls (MX FP8 E4M3, MXFP8[E4M3]{block} via dmx.compressor)
-#   mxfp8_e5m2 -> mxfp8_e5m2_quantizer_cls (MX FP8 E5M2, MXFP8[E5M2]{block} via dmx.compressor)
+#   sfp4      -> sfp4_quantizer_cls         (the vendor SFP4, E4M4 block scale from torch_quant)
+#   nvfp4     -> nvfp4_quantizer_cls        (NVIDIA FP4,  NVFP4[E2M1]{16} via blockfmt)
+#   mxfp4     -> mxfp4_quantizer_cls        (MX FP4,      MXFP4[E2M1]{block} via blockfmt)
+#   mxint4    -> mxint4_quantizer_cls       (MX INT4,     MXINT4{block} via blockfmt)
+#   mxint8    -> mxint8_quantizer_cls       (MX INT8,     MXINT8{block} via blockfmt)
+#   mxfp8_e4m3 -> mxfp8_e4m3_quantizer_cls (MX FP8 E4M3, MXFP8[E4M3]{block} via blockfmt)
+#   mxfp8_e5m2 -> mxfp8_e5m2_quantizer_cls (MX FP8 E5M2, MXFP8[E5M2]{block} via blockfmt)
 #   rtn_int4  -> nBits_quantizer            (INT4 symmetric per-channel)
 #   rtn_int8  -> nBits_quantizer            (INT8 symmetric per-channel)
 ################################################################################

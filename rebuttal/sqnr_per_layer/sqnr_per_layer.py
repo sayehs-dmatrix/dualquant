@@ -7,7 +7,7 @@ the SQNR (in dB) of the quantised output relative to the FP reference.
 
 Higher SQNR = closer to FP. The per-layer view shows which layers each
 method handles well and which it doesn't — complements the per-channel
-scale-correlation tables in the other Rebutal_Neurips scripts.
+scale-correlation tables in the other rebuttal scripts.
 
 Standalone — uses the main codebase's modules (via the same imports main.py
 uses) but does not modify anything in the codebase.
@@ -28,9 +28,9 @@ Defaults:
     quantisation noise).
 
 Usage:
-    python Rebutal_Neurips/sqnr_per_layer.py --model meta-llama/Llama-3.2-1B
-    python Rebutal_Neurips/sqnr_per_layer.py --model Qwen/Qwen3-0.6B --nsamples 2
-    python Rebutal_Neurips/sqnr_per_layer.py --model meta-llama/Llama-3.2-1B \\
+    python rebuttal/sqnr_per_layer.py --model meta-llama/Llama-3.2-1B
+    python rebuttal/sqnr_per_layer.py --model Qwen/Qwen3-0.6B --nsamples 2
+    python rebuttal/sqnr_per_layer.py --model meta-llama/Llama-3.2-1B \\
         --weight-fmt mxint4 --weight-block-size 32 --weight-scale-format e8m0 \\
         --act-fmt mxint4 --act-quant on
 """
@@ -65,7 +65,7 @@ print("[import-debug] trying formats.base", flush=True)
 from formats.base import FormatSpec  # noqa: F401
 print("[import-debug] formats.base OK", flush=True)
 
-print("[import-debug] trying formats.mx (imports dmx.compressor)", flush=True)
+print("[import-debug] trying formats.mx (imports blockfmt)", flush=True)
 from formats import mx  # noqa: F401
 print("[import-debug] formats.mx OK", flush=True)
 

@@ -141,7 +141,7 @@ for model in "${MODELS[@]}"; do
         if [[ "${MLP_LAYERS}"  == "off" ]]; then ARGS+=(--no-mlp-layers);  fi
         if [[ -n "${ISOLATE_LAYER}" ]]; then ARGS+=(--isolate-layer "${ISOLATE_LAYER}"); fi
 
-        python -u Rebutal_Neurips/sqnr_per_layer.py "${ARGS[@]}" \
+        python -u rebuttal/sqnr_per_layer.py "${ARGS[@]}" \
             || echo "  [FAILED] ${model} / ${fmt} — skipping"
     done
 done

@@ -26,7 +26,7 @@ from scipy.stats import pearsonr, spearmanr
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 _HERE    = os.path.dirname(os.path.abspath(__file__))
-_ROOT    = os.path.dirname(os.path.dirname(_HERE))  # scale_comparison/ → Rebutal_Neurips/ → Dualquant_codebase_20260508/
+_ROOT    = os.path.dirname(os.path.dirname(_HERE))  # scale_comparison/ → rebuttal/ → Dualquant_codebase_20260508/
 SQ_DIR   = os.path.join(_ROOT, "scales_smoothquant_rtn_int4")
 DQ_DIR   = os.path.join(_ROOT, "scales_dualquant_rtn_int4")
 

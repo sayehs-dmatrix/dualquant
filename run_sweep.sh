@@ -13,7 +13,7 @@ export HF_DATASETS_TRUST_REMOTE_CODE=1
 # Needs an nvcc that supports c++20 (CUDA >= 12.x). Override CUDA_HOME for your
 # machine; the default below is only used if it actually exists, so an unset or
 # wrong value fails loudly at nvcc time rather than silently pointing nowhere.
-: "${CUDA_HOME:=/home/coder/miniconda3}"
+: "${CUDA_HOME:=<HOME>}"
 if [ ! -x "${CUDA_HOME}/bin/nvcc" ]; then
     echo "warning: no nvcc at ${CUDA_HOME}/bin/nvcc -- set CUDA_HOME to a CUDA >= 12.x install" >&2
 fi

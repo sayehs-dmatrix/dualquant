@@ -1,5 +1,5 @@
 import os, sys
-sys.path.insert(0, _os.path.join(_REPO_ROOT, "Rebutal_Neurips/real_int4_kernel"))
+sys.path.insert(0, _os.path.join(_REPO_ROOT, "rebuttal/real_int4_kernel"))
 sys.path.insert(0, _REPO_ROOT)
 import torch, transformers
 from transformers import StaticCache

@@ -17,7 +17,7 @@ Inner-quant mode is selected by `dualquant_to_element_tensor` in opt_config:
                       rounded by the chosen scale_format.
 
     False (legacy)  - inside the dualquant iteration the inner quantiser is
-                      the full block format via dmx.compressor (the cast
+                      the full block format via blockfmt (the cast
                       applies its own internal block scale on top of alpha,
                       beta). Kept for parity with the historical baseline.
 
@@ -44,7 +44,7 @@ from torch_quant import (
     find_ebias,
     float_to_fp4,
 )
-from dmx.compressor import Format
+from blockfmt import Format
 
 
 # ----- format constants -----------------------------------------------------
@@ -174,7 +174,7 @@ def _inner_quant_element(W_scaled, quant_method, block_size):
 # ----- inner block quantiser (dualquant_to_element_tensor=False) ------------
 
 def _inner_quant_block(W_scaled, quant_method, block_size):
-    """Block-format quant via dmx.compressor — applies its own internal block scale."""
+    """Block-format quant via blockfmt — applies its own internal block scale."""
     if quant_method == "nvfp4":
         return Format.from_shorthand("NVFP4[E2M1]{16}").cast(W_scaled, -1)
     if quant_method == "mxfp4":
