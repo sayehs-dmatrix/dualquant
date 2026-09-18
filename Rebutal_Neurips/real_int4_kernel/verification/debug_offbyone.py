@@ -1,9 +1,12 @@
 import os, sys
-sys.path.insert(0, "/root/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/Rebutal_Neurips/real_int4_kernel")
-sys.path.insert(0, "/root/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508")
+sys.path.insert(0, _os.path.join(_REPO_ROOT, "Rebutal_Neurips/real_int4_kernel"))
+sys.path.insert(0, _REPO_ROOT)
 import torch, transformers
 from transformers import StaticCache
 from main import load_model
+
+import os as _os
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))  # repo root from this file
 
 dev = torch.device("cuda:0")
 model_id = "meta-llama/Llama-3.1-8B"

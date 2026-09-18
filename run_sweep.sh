@@ -10,7 +10,14 @@ set -euo pipefail
 # ── GPU / env ──────────────────────────────────────────────────────────────────
 export CUDA_VISIBLE_DEVICES=0,1
 export HF_DATASETS_TRUST_REMOTE_CODE=1
-export CUDA_HOME=/home/coder/miniconda3   # use CUDA 12.8 nvcc (supports c++20) instead of /usr/local/cuda (11.8)
+# Needs an nvcc that supports c++20 (CUDA >= 12.x). Override CUDA_HOME for your
+# machine; the default below is only used if it actually exists, so an unset or
+# wrong value fails loudly at nvcc time rather than silently pointing nowhere.
+: "${CUDA_HOME:=/home/coder/miniconda3}"
+if [ ! -x "${CUDA_HOME}/bin/nvcc" ]; then
+    echo "warning: no nvcc at ${CUDA_HOME}/bin/nvcc -- set CUDA_HOME to a CUDA >= 12.x install" >&2
+fi
+export CUDA_HOME
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"

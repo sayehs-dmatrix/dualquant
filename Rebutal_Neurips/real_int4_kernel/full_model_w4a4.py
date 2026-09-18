@@ -15,9 +15,7 @@ import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_KERNEL_DIR = ("/root/numrd/Quantization_Repo_July2025/"
-               "MSE_Reduction_Two_approache_All_DataFormats_20260410/"
-               "__Baselines_with_the_same_fils_as_MSE/DualScale_Kernel_Benchmark")
+_KERNEL_DIR = _os.path.join(_REPO_ROOT, "vendor", "dualscale_kernel_benchmark")
 for p in (_CODEBASE_ROOT, _KERNEL_DIR, _HERE):
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -32,6 +30,9 @@ from fused_dual_scale_kernel import pack_int4_weights
 from fused_w4a4_kernel import fused_w4a4_gemm
 from e2e_bench_utils import prefill_bench, decode_bench
 from wrap_cache import wrap_cached
+
+import os as _os
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))  # repo root from this file
 
 METHOD_CFG = os.path.join(_CODEBASE_ROOT, "configs", "methods.json")
 GROUP_SIZE = 64   # matches block_size=64, the default used for the paper's reported PPL numbers

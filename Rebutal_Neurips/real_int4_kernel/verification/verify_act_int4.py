@@ -4,9 +4,11 @@ _nk = os.environ.get("NUNCHAKU_DIR")
 if _nk: sys.path.insert(0, _nk)
 import nunchaku_min
 
+import os as _os
+_REPO_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))))  # repo root from this file
+
 dev = torch.device("cuda:0")
-d = torch.load("/root/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/Rebutal_Neurips/"
-               "real_int4_kernel/wrap_cache/meta-llama__Llama-3.1-8B__layer0.o_proj__bs64__68ccec1c.pt",
+d = torch.load(_os.path.join(_REPO_ROOT, "Rebutal_Neurips", "real_int4_kernel/wrap_cache/meta-llama__Llama-3.1-8B__layer0.o_proj__bs64__68ccec1c.pt"),
                map_location="cpu")
 mat_q, beta = d["mat_q"], d["beta"]
 N, K = mat_q.shape
