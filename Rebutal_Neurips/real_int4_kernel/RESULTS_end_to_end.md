@@ -15,8 +15,15 @@ not simulated quantization.
 | INT4 path | DualQuant BCD (`mat_q` + per-channel `beta`) → nunchaku packed W4A4 CUTLASS GEMM |
 | Quantized | all 7 projections × 32 layers (q,k,v,o,gate,up,down) = 224 linear layers |
 | Not quantized | embedding, `lm_head`, norms (standard practice) |
-| Throughput workload | 82-token prompt; decode = greedy, KV-cache |
-| Accuracy workload | WikiText-2 test, non-overlapping 8192-token windows (35 windows) |
+| Prefill workload | **82-token prompt**, single forward, `use_cache=False` |
+| Decode workload | same 82-token prompt, then **100 generated tokens**, greedy, KV-cache |
+| Accuracy workload | WikiText-2 test, non-overlapping **8192**-token windows (35 windows) |
+
+The **8192 length applies only to the perplexity run** in §1. Every latency, throughput and
+memory number in §2–§4 uses the 82-token prompt and, where decoding, 100 generated tokens
+(prompt + generated = 182 cached positions). Throughput is
+`batch x tokens / latency`: e.g. prefill batch=16 is 16 x 82 / 146.75 ms = 8940 tok/s;
+decode is one token per sequence per replayed step.
 
 ### What is ours vs. third-party
 
@@ -85,11 +92,21 @@ low-precision path, not an optimistic simulation of it.
 | Runtime/allocator overhead | 0.136 | 0.107 |
 | **Weights subtotal** | **16.196** | **5.916** (2.74x) |
 | First-forward scratch | 0.103 (cuBLAS ws) | 0.300 (INT4 act operands + scales + ws) |
-| KV cache (BF16) — batch 1 / 16 | 0.024 / 0.382 | 0.024 / 0.382 |
-| Other activations (BF16 residual, logits) — batch 1 / 16 | 0.012 / 0.065 | 0.012 / 0.065 |
+| KV cache (BF16) — **prefill** batch 1 / 16 | 0 / 0 | 0 / 0 |
+| KV cache (BF16) — **decode** batch 1 / 16 | 0.024 / 0.382 | 0.024 / 0.382 |
+| Other activations (BF16 residual, logits) — **prefill** batch 1 / 16 | 0.030 / 0.356 | 0.030 / 0.356 |
+| Other activations (BF16 residual, logits) — **decode** batch 1 / 16 | 0.012 / 0.065 | 0.012 / 0.065 |
 
 INT4 packed activation operands are 0.080 GB of that scratch across all 224 layers. The KV
 cache and residual stream stay BF16 in both paths, so they are identical and do not shrink.
+
+The two activation rows are listed per workload because they genuinely differ. Prefill runs
+with `use_cache=False`, so it holds **no** KV cache, and its activation term is dominated by
+the full-sequence logits tensor (`[batch x 82 x 128256]` BF16 = 0.021 / 0.337 GB) rather
+than the single-position `[batch x 1 x 128256]` of a decode step. Each total in §2.2 is
+`weights subtotal + first-forward scratch + that workload's KV + its other activations`.
+That is why prefill batch=1 sits 0.006 GB *below* decode batch=1 — it drops 0.024 GB of KV
+and adds 0.018 GB of logits — and 0.091 GB below at batch=16 (−0.382 + 0.291).
 
 ### 2.2 End-to-end memory (GB)
 

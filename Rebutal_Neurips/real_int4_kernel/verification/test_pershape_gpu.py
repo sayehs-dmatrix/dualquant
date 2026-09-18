@@ -10,8 +10,10 @@ replay. Host cost collapses to a single graph launch, and using 32 distinct weig
 the model's 32 layers) means the weights stream from DRAM instead of sitting hot in the
 4090's 72MB L2 -- which is what the real model does.
 """
+import os
 import sys, time, torch
-sys.path.insert(0, "/tmp/claude-0/-root-numrd/1e334428-137f-442b-9669-4bc5945263d0/scratchpad/svdquant_repo/build/lib.linux-x86_64-cpython-312")
+_nk = os.environ.get("NUNCHAKU_DIR")
+if _nk: sys.path.insert(0, _nk)
 import nunchaku_min
 
 dev = torch.device("cuda:0")

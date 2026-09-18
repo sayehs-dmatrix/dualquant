@@ -5,14 +5,18 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy.stats import pearsonr
 
+import os as _os
+_DQ_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))  # repo root, resolved from this file
+
 # ── Pick a model ────────────────────────────────────────────────────────────
 # MODEL = "meta-llama_Llama-3.1-8B"
 MODEL = "meta-llama_Llama-3.2-1B"
 # MODEL = "Qwen_Qwen3-0.6B"
 # MODEL = "Qwen_Qwen2.5-7B"
 
-SQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_smoothquant_rtn_int4"
-DQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_dualquant_rtn_int4"
+SQ_DIR = _os.path.join(_DQ_ROOT, "scales_smoothquant_rtn_int4")
+DQ_DIR = _os.path.join(_DQ_ROOT, "scales_dualquant_rtn_int4")
 OUT_DIR = f"./plots_{MODEL}"
 os.makedirs(OUT_DIR, exist_ok=True)
 

@@ -1,5 +1,7 @@
+import os
 import sys, time, torch
-sys.path.insert(0, "/tmp/claude-0/-root-numrd/1e334428-137f-442b-9669-4bc5945263d0/scratchpad/svdquant_repo/build/lib.linux-x86_64-cpython-312")
+_nk = os.environ.get("NUNCHAKU_DIR")
+if _nk: sys.path.insert(0, _nk)
 import nunchaku_min
 
 dev = torch.device("cuda:0")

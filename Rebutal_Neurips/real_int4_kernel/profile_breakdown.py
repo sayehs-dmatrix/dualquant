@@ -13,12 +13,13 @@ raw kernels (no ATen op attribution), components are identified by kernel name:
 
 Usage:  python profile_breakdown.py --mode bf16|int4
 """
+import os
 import argparse, os, sys
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 for p in (os.path.dirname(os.path.dirname(_HERE)), _HERE,
-          "/tmp/claude-0/-root-numrd/1e334428-137f-442b-9669-4bc5945263d0/scratchpad/svdquant_repo/build/lib.linux-x86_64-cpython-312"):
-    if p not in sys.path:
+          os.environ.get("NUNCHAKU_DIR", "")):
+    if p and p not in sys.path:
         sys.path.insert(0, p)
 
 import torch, transformers

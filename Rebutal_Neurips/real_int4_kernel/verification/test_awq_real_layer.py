@@ -1,6 +1,8 @@
+import os
 import sys
 import torch
-sys.path.insert(0, "/tmp/claude-0/-root-numrd/1e334428-137f-442b-9669-4bc5945263d0/scratchpad/svdquant_repo/build/lib.linux-x86_64-cpython-312")
+_nk = os.environ.get("NUNCHAKU_DIR")
+if _nk: sys.path.insert(0, _nk)
 sys.path.insert(0, "/root/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/Rebutal_Neurips/real_int4_kernel")
 import nunchaku_min
 from awq_gemv_pack import build_awq_gemv_weights, GROUP_SIZE

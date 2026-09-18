@@ -160,8 +160,8 @@ def compare_scales(s1, s2, name="", eps=1e-8, topk_vals=(10, 20, 50)):
 # MODEL = "Qwen_Qwen3-0.6B"
 MODEL = "Qwen_Qwen2.5-7B"
 
-SQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_smoothquant_rtn_int4"
-DQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_dualquant_rtn_int4"
+SQ_DIR = _os.path.join(_DQ_ROOT, "scales_smoothquant_rtn_int4")
+DQ_DIR = _os.path.join(_DQ_ROOT, "scales_dualquant_rtn_int4")
 
 sq05 = torch.load(f"{SQ_DIR}/SQ_scales_{MODEL}_alpha_0.5.pt")["saved_scales"]
 sq00 = torch.load(f"{SQ_DIR}/SQ_scales_{MODEL}_alpha_0.0.pt")["saved_scales"]   # weight-only trivial baseline
@@ -307,6 +307,10 @@ for proj in proj_map:
 import os
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+
+import os as _os
+_DQ_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))  # repo root, resolved from this file
 
 _COMPARISONS = [
     ("[B] SQ.5pp vs DQ",       "B_sq05pp_vs_dq"),

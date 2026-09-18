@@ -2,6 +2,10 @@ import torch
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
 
+import os as _os
+_DQ_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))  # repo root, resolved from this file
+
 
 def identify_outlier_channels(s, threshold=2.0):
     """
@@ -234,8 +238,8 @@ MODEL = "meta-llama_Llama-3.2-1B"
 # MODEL = "Qwen_Qwen3-0.6B"
 # MODEL = "Qwen_Qwen2.5-7B"
 
-SQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_smoothquant_rtn_int4"
-DQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_dualquant_rtn_int4"
+SQ_DIR = _os.path.join(_DQ_ROOT, "scales_smoothquant_rtn_int4")
+DQ_DIR = _os.path.join(_DQ_ROOT, "scales_dualquant_rtn_int4")
 
 sq05 = torch.load(f"{SQ_DIR}/SQ_scales_{MODEL}_alpha_0.5.pt")["saved_scales"]
 sq00 = torch.load(f"{SQ_DIR}/SQ_scales_{MODEL}_alpha_0.0.pt")["saved_scales"]   # weight-only trivial baseline

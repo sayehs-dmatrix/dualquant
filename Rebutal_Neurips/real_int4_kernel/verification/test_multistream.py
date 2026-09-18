@@ -6,8 +6,10 @@ are gate and up -- so running them on separate streams should overlap and recove
 idle SMs. Uses forward_static because it pushes the caller's stream onto nunchaku's
 internal stream stack (forward_beta always lands on legacy stream 0, so it cannot overlap).
 """
+import os
 import sys, time, torch
-sys.path.insert(0, "/tmp/claude-0/-root-numrd/1e334428-137f-442b-9669-4bc5945263d0/scratchpad/svdquant_repo/build/lib.linux-x86_64-cpython-312")
+_nk = os.environ.get("NUNCHAKU_DIR")
+if _nk: sys.path.insert(0, _nk)
 import nunchaku_min
 
 dev = torch.device("cuda:0")

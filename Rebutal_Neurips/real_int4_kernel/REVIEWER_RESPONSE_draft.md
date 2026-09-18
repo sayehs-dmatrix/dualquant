@@ -68,11 +68,21 @@ real DualQuant layer is 19.0 dB, consistent with the expected W4A4 noise floor.
 | Runtime/allocator overhead | 0.136 | 0.107 |
 | **Weights subtotal** | **16.196** | **5.916** |
 | First-forward scratch | 0.103 | 0.300 |
-| KV cache (BF16) — batch 1 / 16 | 0.024 / 0.382 | 0.024 / 0.382 |
-| Other activations (BF16 residual, logits) — batch 1 / 16 | 0.012 / 0.065 | 0.012 / 0.065 |
+| KV cache (BF16) — **prefill** batch 1 / 16 | 0 / 0 | 0 / 0 |
+| KV cache (BF16) — **decode** batch 1 / 16 | 0.024 / 0.382 | 0.024 / 0.382 |
+| Other activations (BF16 residual, logits) — **prefill** batch 1 / 16 | 0.030 / 0.356 | 0.030 / 0.356 |
+| Other activations (BF16 residual, logits) — **decode** batch 1 / 16 | 0.012 / 0.065 | 0.012 / 0.065 |
 
 INT4 packed activation operands account for 0.080 GB of the scratch across all 224 layers;
 the KV cache and residual stream remain BF16 in both paths and are therefore identical.
+
+The activation rows are per workload because they differ: prefill runs with
+`use_cache=False` and so holds **no** KV cache, while its activation term is dominated by
+the full-sequence logits tensor (`[batch x 82 x 128256]` BF16 = 0.021 / 0.337 GB) instead
+of the single-position `[batch x 1 x 128256]` of a decode step. Each total in §2.2 is
+`weights subtotal + first-forward scratch + that workload's KV + its other activations`,
+which is why prefill batch=1 is 0.006 GB *below* decode batch=1 (−0.024 KV, +0.018 logits)
+and 0.091 GB below at batch=16.
 
 ### 2.2 End-to-end memory (GB)
 
@@ -90,6 +100,13 @@ INT4 footprint by ~3.5x. Weights alone: 16.196 → 5.916 GB (**2.74x**).
 ---
 
 ## 3. Latency and throughput
+
+**Workload lengths.** Prefill is an **82-token** prompt in a single forward with
+`use_cache=False`; decode continues that prompt for **100 generated tokens** greedily with a
+KV-cache (182 cached positions at the end). The **8192 length in §1 applies only to the
+perplexity run** — it is not the throughput or memory workload. Throughput is
+`batch x tokens / latency`, e.g. prefill batch=16 is 16 x 82 / 146.75 ms = 8940 tok/s, and
+decode advances one token per sequence per step.
 
 ### 3.1 Component breakdown of GPU time (ms), **BF16 → W4A4**
 

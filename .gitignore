@@ -1,9 +1,32 @@
+# Inherited from the two parent .gitignore files this codebase used to sit under
+# (numrd/.gitignore and numrd/Quantization_Repo_July2025/.gitignore). They are
+# reproduced here now that the repo is standalone: without the `*.pt` rule below
+# git would surface ~10,000 cache tensors (hessian_cache/ alone is ~925 GB).
 __pycache__/
 *.pyc
 *.pyo
+.vscode/
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+core.*
 
-# Re-include files that the parent ../.gitignore filters out by extension
-# but that this codebase legitimately needs to track:
+# Large binary artefacts: model weights, cached tensors, figures, result dumps.
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.png
+*.pickle
+*.json
+
+# Derived caches -- regenerable, and far too large to track.
+hessian_cache/
+scale_cache/
+Rebutal_Neurips/real_int4_kernel/wrap_cache/
+*.tar.gz
+
+# Re-include files that the extension rules above filter out but that this
+# codebase legitimately needs to track.
 !configs/methods.json
 !smoothquant/act_scales/*.pt
 !scales_dualquant_rtn_int4/*.pt

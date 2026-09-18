@@ -16,10 +16,9 @@ import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _CODEBASE_ROOT = os.path.dirname(os.path.dirname(_HERE))
-_NUNCHAKU_DIR = ("/tmp/claude-0/-root-numrd/1e334428-137f-442b-9669-4bc5945263d0/"
-                 "scratchpad/svdquant_repo/build/lib.linux-x86_64-cpython-312")
+_NUNCHAKU_DIR = os.environ.get("NUNCHAKU_DIR", "")
 for p in (_CODEBASE_ROOT, _HERE, _NUNCHAKU_DIR):
-    if p not in sys.path:
+    if p and p not in sys.path:
         sys.path.insert(0, p)
 
 import torch

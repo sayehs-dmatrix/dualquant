@@ -12,10 +12,14 @@ import torch
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
 
+import os as _os
+_DQ_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(
+    _os.path.abspath(__file__))))  # repo root, resolved from this file
+
 # ── Config ──────────────────────────────────────────────────────────────────
 MODEL  = "meta-llama_Llama-3.2-1B"
-SQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_smoothquant_rtn_int4"
-DQ_DIR = "/home/coder/numrd/Quantization_Repo_July2025/Dualquant_codebase_20260508/scales_dualquant_rtn_int4"
+SQ_DIR = _os.path.join(_DQ_ROOT, "scales_smoothquant_rtn_int4")
+DQ_DIR = _os.path.join(_DQ_ROOT, "scales_dualquant_rtn_int4")
 
 # DQ init tags — filename is `DQ_{MODEL}_iter15scales_rtn_int4_init_{tag}.pt`
 # Note: Llama-3.2-1B files use the explicit `row_max_abs` / `row_all_one` naming.
