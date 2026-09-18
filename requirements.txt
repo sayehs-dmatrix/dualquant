@@ -73,8 +73,9 @@ pandas==3.0.5                                # result-table scripts only
 #   here. That code path is therefore broken independently of packaging --
 #   it was already broken before this repo was extracted.
 #
-# * legacy_vendor/datautils.py calls load_dataset('wikitext', ...). Namespace-
-#   less dataset ids are rejected by huggingface-hub >= 1.0; use
-#   'Salesforce/wikitext' (already present as a commented-out line there) if you
-#   hit `HfUriError`.
+# * Install the block-format backend BEFORE `pip install -r requirements.txt`,
+#   or pass `--constraint requirements.txt` when installing it. Installing it
+#   afterwards re-resolves its own dependency tree and silently upgrades torch
+#   past the pin above (observed: 2.13.0 -> 2.14.0), because a pin in this file
+#   is not a constraint on a later, separate install.
 # ─────────────────────────────────────────────────────────────────────────────

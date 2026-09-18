@@ -10,11 +10,9 @@ def set_seed(seed):
 
 def get_wikitext2_mine(nsamples, model_path,  seed, seqlen):
     from datasets import load_dataset
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
-
-    # traindata = load_dataset("Salesforce/wikitext", 'wikitext-2-raw-v1', split='train')
-    # testdata = load_dataset("Salesforce/wikitext", 'wikitext-2-raw-v1', split='test')
+    # Namespaced id: huggingface_hub >= 1.0 rejects the bare 'wikitext'.
+    traindata = load_dataset("Salesforce/wikitext", 'wikitext-2-raw-v1', split='train')
+    testdata = load_dataset("Salesforce/wikitext", 'wikitext-2-raw-v1', split='test')
 
    
     from transformers import AutoTokenizer 
@@ -58,7 +56,8 @@ def get_wikitext2_mine(nsamples, model_path,  seed, seqlen):
 
 
 def get_wikitext2(tokenizer, seqlen):
-    testdata = datasets.load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    # Namespaced id: huggingface_hub >= 1.0 rejects the bare 'wikitext'.
+    testdata = datasets.load_dataset("Salesforce/wikitext", 'wikitext-2-raw-v1', split='test')
     testloader = []
     testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
     # num_chunks = testenc.input_ids.size(1) // seqlen
