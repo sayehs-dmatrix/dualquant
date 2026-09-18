@@ -19,7 +19,7 @@ have not been rewritten in the new style are vendored byte-for-byte under
 ## Folder layout
 
 ```
-Dualquant_codebase_20260508/
+dualquant/
 ├── main.py                      # single entrypoint (CLI flags drive everything)
 ├── run_sweep.sh                 # bash sweep over MODELS × METHODS × WEIGHT_FMTS
 ├── _legacy_path.py              # sys.path shim → legacy_vendor/
@@ -40,10 +40,34 @@ Dualquant_codebase_20260508/
 │   ├── awq.py, datautils.py, eval_utils.py, sinkhorn.py, torch_quant.py
 │   ├── sinq_functions.py, layer_wrapper_baseline_data_formats_methods.py
 │   └── smoothquant/             #   smooth_with_scale_dict.smooth_lm
+├── blockfmt/                    # indirection to the block-format library (see Requirements)
 ├── configs/methods.json         # one merged file with per-method hyperparams
 ├── results/                     # per-model PPL CSVs from run_sweep.sh
+├── scales_dualquant_rtn_int4/   # saved dualquant column scales (.pt)
+├── scales_smoothquant_rtn_int4/ # saved SmoothQuant scales (.pt)
+├── vendor/                      # third-party code kept in-tree to stay self-contained
+│   └── dualscale_kernel_benchmark/  # fused_dual_scale_kernel used by the INT4 validators
+├── ablation/                    # ablation studies: init, scale comparison, SQNR, INT4 kernel
 └── README.md
 ```
+
+Not tracked (regenerable, and large): `hessian_cache/`, `scale_cache/`,
+`ablation/real_int4_kernel/wrap_cache/`.
+
+## Requirements
+
+Beyond `requirements.txt`, the pipeline needs an external block-format
+quantization library that provides a `Format` class with
+`Format.from_shorthand(...)` and `.cast(tensor)`. It is not publicly
+redistributable, so it is resolved at import time from an environment
+variable rather than being named in the source:
+
+```bash
+export BLOCKFMT_BACKEND=<python.module.path>   # module exposing `Format`
+```
+
+`blockfmt/__init__.py` raises a descriptive `ImportError` if it is unset.
+Every weight/activation format goes through it, so nothing runs without it.
 
 ## Usage
 
