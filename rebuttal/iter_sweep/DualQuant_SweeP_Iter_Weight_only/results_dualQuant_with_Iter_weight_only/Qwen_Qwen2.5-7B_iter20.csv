@@ -1,5 +1,0 @@
-model,method,preprocess,weight_fmt,act_fmt,ppl_wikitext,ppl_c4
-Qwen/Qwen2.5-7B,dualquant,none,mxfp4,off,6.6542,N/A
-Qwen/Qwen2.5-7B,dualquant,none,mxint4,off,6.6158,N/A
-Qwen/Qwen2.5-7B,dualquant,none,nvfp4,off,6.7695,N/A
-Qwen/Qwen2.5-7B,dualquant,none,rtn_int4,off,6.4624,N/A

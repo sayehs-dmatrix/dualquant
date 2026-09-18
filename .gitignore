@@ -22,7 +22,7 @@ core.*
 # Derived caches -- regenerable, and far too large to track.
 hessian_cache/
 scale_cache/
-rebuttal/real_int4_kernel/wrap_cache/
+ablation/real_int4_kernel/wrap_cache/
 *.tar.gz
 
 # Re-include files that the extension rules above filter out but that this

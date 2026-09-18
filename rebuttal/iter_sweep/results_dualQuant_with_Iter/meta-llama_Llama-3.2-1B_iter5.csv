@@ -1,3 +1,0 @@
-model,method,preprocess,weight_fmt,act_fmt,ppl_wikitext,ppl_c4
-meta-llama/Llama-3.2-1B,dualquant,none,rtn_int4,rtn_int4,11.8862,N/A
-meta-llama/Llama-3.2-1B,dualquant,none,mxfp4,rtn_int4,12.3015,N/A

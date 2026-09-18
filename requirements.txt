@@ -44,14 +44,14 @@ lm_eval==0.4.13
 #   pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git
 # fast-hadamard-transform
 
-matplotlib>=3.8 ; python_version >= "3.9"   # rebuttal plotting scripts only
+matplotlib>=3.8 ; python_version >= "3.9"   # ablation plotting scripts only
 pandas==3.0.5                                # result-table scripts only
 
-# Triton W4A4 path (rebuttal/real_int4_kernel/fused_w4a4_kernel.py).
+# Triton W4A4 path (ablation/real_int4_kernel/fused_w4a4_kernel.py).
 # Ships with the CUDA torch wheels; listed for visibility, not installed twice.
 # triton==3.7.1
 
-# The packed-INT4 kernel path (rebuttal/real_int4_kernel/) additionally
+# The packed-INT4 kernel path (ablation/real_int4_kernel/) additionally
 # needs `nunchaku_min`, which is BUILT, not pip-installed: apply
 # nunchaku_patches/0001-dualquant-w4a4-modifications.patch to upstream nunchaku
 # at the commit in nunchaku_patches/submodule_pins.txt, build with

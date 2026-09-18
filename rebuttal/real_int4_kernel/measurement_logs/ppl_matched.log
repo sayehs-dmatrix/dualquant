@@ -1,9 +1,0 @@
-=== INT4 real packed kernel PPL (wikitext, seqlen=2048) ===
-Running real PPL evaluation (wikitext) through nunchaku kernel...
-    ppl = evaluate_ppl(model, tokenizer, args)
-  File "<REPO>", line 277, in evaluate_ppl
-=== BF16 baseline PPL (wikitext, seqlen=2048) ===
-Running real PPL evaluation (wikitext) on the BF16 model...
-    ppl = evaluate_ppl(model, tokenizer, args)
-  File "<REPO>", line 277, in evaluate_ppl
-=== DONE ===
